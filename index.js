@@ -36,13 +36,20 @@ app.post('/woocommerce-webhook', async (req, res) => {
       name: order.billing_address?.first_name || "",
       phone: order.billing_address?.phone || "",
       email: order.billing_address?.email || "",
-      amount: order.total,
-      product: order.line_items?.[0]?.name,
-      sku: order.line_items?.[0]?.sku,
-      size: size,
-      address: order.billing_address?.address_1,
-      status: order.payment_details?.paid ? "paid" : "pending_payment"
+      amount: Number(order.total) || 0,
+      product: order.line_items?.[0]?.name || "",
+      sku: order.line_items?.[0]?.sku || "",
+      size: size || "",
+      address: order.billing_address?.address_1 || "",
+      status: order.payment_details?.paid ? "paid" : "pending_payment",
+      paid: order.payment_details?.paid ? true : false,
+      whatsapp_sent: false,
+      reminder24_sent: false,
+      reminder40_sent: false,
+      supplier_sent: false,
+      created_at: new Date().toISOString()
     };
+
 
     console.log("MAPPED:", mapped);
 
