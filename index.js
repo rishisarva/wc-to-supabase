@@ -13,8 +13,8 @@ app.use(bodyParser.json({ limit: "5mb" }));
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON = process.env.SUPABASE_ANON;
 
-const TELEGRAM_TOKEN = 8549035142:AAEmjUh-rgJgwr5UJcf4B1zNblVxq1pl5jM;
-const SUPPLIER_CHAT_ID = 8525379867;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const SUPPLIER_CHAT_ID = process.env.SUPPLIER_CHAT_ID;
 
 console.log("🚀 Render Server Starting…");
 console.log("Supabase URL:", SUPABASE_URL);
