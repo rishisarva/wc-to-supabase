@@ -120,87 +120,80 @@ app.post("/woocommerce-webhook", async (req, res) => {
 });
 
 // ----------------- Telegram: /paid <order_id> command -----------------
+// ----------------- Telegram: /paid <order_id> command -----------------
 if (bot) {
   bot.onText(/\/paid\s+(.+)/i, async (msg, match) => {
     const chatId = msg.chat.id;
-    const orderId = (match && match[1]) ? match[1].trim() : null;
-
-    if (!orderId) {
-      return bot.sendMessage(chatId, "Usage: /paid <order_id>");
-    }
+    const orderId = match[1]?.trim();
+    if (!orderId) return bot.sendMessage(chatId, "Usage: /paid <order_id>");
 
     try {
-      // fetch the order
-      const fetchUrl = `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`;
+      // Fetch Supabase order
+      const fetchUrl = `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}&select=*`;
       const fetchRes = await axios.get(fetchUrl, { headers: sbHeaders });
-      if (!fetchRes.data || !fetchRes.data.length) {
+
+      if (!fetchRes.data?.length)
         return bot.sendMessage(chatId, `❌ Order ${orderId} not found.`);
-      }
+
       const order = fetchRes.data[0];
 
-      // set paid flags
-      const paidAt = nowISO();
-      const paidDate = (new Date()).toISOString(); // store iso timestamp; we'll format in messages
-      const patchUrl = `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`;
-      await axios.patch(patchUrl, {
-        status: "paid",
-        paid_at: paidAt,
-        paid_date: paidDate,
-        next_message: null,
-        reminder_24_sent: true,
-        reminder_48_sent: true,
-        reminder_72_sent: true
-      }, { headers: sbHeaders });
-
-      // build "till now" paid list for TODAY only (from midnight IST)
-      const now = new Date();
-      // compute start of today IST
-      const startOfToday = (() => {
-        try {
-          const dt = DateTime.now().setZone(TIMEZONE).startOf("day");
-          return dt.toUTC().toISO(); // convert to ISO UTC to query supabase which stores timestamptz
-        } catch (e) {
-          // fallback: use 24 hours back
-          return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        }
-      })();
-
-      // fetch paid orders since startOfToday
-      const paidQ = `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(startOfToday)}&select=order_id,name,amount,paid_at,product`;
-      const paidRes = await axios.get(paidQ, { headers: sbHeaders });
-      const paidRows = paidRes.data || [];
-
-      // 1) send till-now paid list (short format)
-      let paidListText = `📌 Paid orders for today (till now):\n\n`;
-      if (paidRows.length === 0) {
-        paidListText += "_No paid orders for today so far._";
-      } else {
-        for (const r of paidRows) {
-          // format time using timezone if possible
-          let formatted = r.paid_at;
-          try {
-            formatted = DateTime.fromISO(r.paid_at).setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
-          } catch (e) {}
-          paidListText += `${r.name} • ${r.order_id} 🟩 ${formatted} • ₹${r.amount}\n`;
-        }
+      // ---- Update WooCommerce to PROCESSING ----
+      try {
+        await axios.put(
+          `https://visionsjersey.in/wp-json/wc/v3/orders/${orderId}`,
+          { status: "processing" },
+          { auth: { username: process.env.WC_KEY, password: process.env.WC_SECRET } }
+        );
+      } catch (err) {
+        console.log("WooCommerce update failed →", err.response?.data || err);
       }
-      await bot.sendMessage(chatId, paidListText, { parse_mode: "Markdown" });
 
-      // 2) Supplier format (as requested)
-      // Supplier header EXACT:
-      const supplierHeader = `From:\nVision Jerseys\n+91 93279 05965\n\nTo:\nname: ${order.name}\nshipping address: ${order.address}\nstate: ${order.state || ""}\npincode: ${order.pincode || ""}\nnumber: ${order.phone}\nskuid: ${order.sku}\n\nPRODUCT:\n${order.product}\n\nproduct SIZE: ${order.size || ""}\n\ntotal quantity: ${order.quantity || 1}\n\nSHIPPMENT MODE: Normal\n`;
+      // ---- Update Supabase ----
+      const patchUrl = `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}`;
+      await axios.patch(
+        patchUrl,
+        {
+          status: "paid",
+          paid_at: new Date().toISOString(),
+          paid_message_pending: true, // AutoJS will detect
+          next_message: null, reminder_24_sent: true, reminder_48_sent: true, reminder_72_sent: true
+        },
+        { headers: sbHeaders }
+      );
+
+      // ---- Supplier Format ----
+      const supplierText =
+`📦 *NEW PAID ORDER*
+
+From:
+Vision Jerseys 
++91 93279 05965
+
+To:
+Name: ${order.name}
+Address: ${order.address}
+State: ${order.state}
+Pincode: ${order.pincode}
+Phone: ${order.phone}
+SKU ID: ${order.sku}
+
+Product: ${order.product}
+Size: ${order.size}
+Quantity: ${order.quantity}
+
+Shipment Mode: Normal
+`;
 
       if (SUPPLIER_CHAT_ID) {
-        await bot.sendMessage(SUPPLIER_CHAT_ID, supplierHeader, { parse_mode: "Markdown" });
-      } else {
-        // if supplier chat id missing, send back to the user who ran /paid
-        await bot.sendMessage(chatId, supplierHeader);
+        await bot.sendMessage(SUPPLIER_CHAT_ID, supplierText, { parse_mode: "Markdown" });
       }
 
-      return bot.sendMessage(chatId, `✅ Order ${orderId} marked PAID and supplier message sent.`);
+      // ---- Reply to Admin ----
+      return bot.sendMessage(chatId, `✅ Order ${orderId} marked PAID.\n✔ WooCommerce Updated\n✔ Supplier Notified\n✔ AutoJS will send Thank-You message.`, { parse_mode: "Markdown" });
+
     } catch (err) {
       console.error("/paid error:", err.response?.data || err.message);
-      return bot.sendMessage(chatId, "⚠️ Error processing /paid. Check server logs.");
+      return bot.sendMessage(chatId, "⚠️ Something went wrong. Check logs.");
     }
   });
 }
