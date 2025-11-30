@@ -31,9 +31,6 @@ const sbHeaders = {
   Prefer: "return=representation"
 };
 
-// in-memory flag to "clear" today's orders from /today (does NOT touch DB)
-let clearedTodayDate = null;
-
 // ---------------- Telegram ----------------
 let bot = null;
 if (TELEGRAM_TOKEN) {
@@ -114,7 +111,11 @@ app.post("/woocommerce-webhook", async (req, res) => {
       paid_at: null,
       paid_message_pending: false,
       resend_qr_pending: false,
-      tracking_sent: false
+      tracking_sent: false,
+
+      // for cancel + restore
+      previous_status: null,
+      previous_wc_status: null
     };
 
     await axios.post(
@@ -165,10 +166,13 @@ if (bot) {
 - Show today's PAID orders
 
 /clear_today
-- Hide today's paid orders from /today (view only)
+- Show today's paid orders with buttons to cancel (Woo + Supabase)
 
 /paidorders
 - Show buttons for paid orders by date (3 days before, today, 3 days after)
+
+/restore <order_id>
+- Restore a cancelled order (Supabase + Woo status)
 `;
 
     try {
@@ -177,6 +181,116 @@ if (bot) {
       console.error("/menu error:", e.message);
     }
   });
+}
+
+/* ---------------------------------------------------
+   Helper: cancel order everywhere (Woo + Supabase)
+   and store previous_status + previous_wc_status
+--------------------------------------------------- */
+async function cancelOrderEverywhere(orderId) {
+  // 1) Fetch Supabase order
+  const fetchRes = await axios.get(
+    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
+      orderId
+    )}&select=*`,
+    { headers: sbHeaders }
+  );
+  if (!fetchRes.data.length) {
+    throw new Error(`Order ${orderId} not found in Supabase.`);
+  }
+  const order = fetchRes.data[0];
+
+  // guess previous Woo status from Supabase status
+  let prevWcStatus = "pending";
+  if (order.status === "paid") prevWcStatus = "processing";
+  else if (order.status === "pending_payment") prevWcStatus = "pending";
+  else if (order.status === "completed") prevWcStatus = "completed";
+
+  // 2) Cancel in WooCommerce
+  if (WC_USER && WC_PASS) {
+    try {
+      await axios.put(
+        `https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`,
+        { status: "cancelled" },
+        { auth: { username: WC_USER, password: WC_PASS } }
+      );
+    } catch (e) {
+      console.error(
+        "Woo cancel failed:",
+        e.response?.data || e.message
+      );
+    }
+  }
+
+  // 3) Cancel in Supabase + store previous statuses
+  await axios.patch(
+    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
+      orderId
+    )}`,
+    {
+      status: "cancelled",
+      next_message: null,
+      reminder_24_sent: true,
+      reminder_48_sent: true,
+      reminder_72_sent: true,
+      previous_status: order.status || null,
+      previous_wc_status: prevWcStatus
+    },
+    { headers: sbHeaders }
+  );
+}
+
+/* ---------------------------------------------------
+   Helper: restore order (Supabase + Woo) using previous_status
+--------------------------------------------------- */
+async function restoreOrderEverywhere(orderId) {
+  // fetch from Supabase
+  const fetchRes = await axios.get(
+    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
+      orderId
+    )}&select=*`,
+    { headers: sbHeaders }
+  );
+  if (!fetchRes.data.length) {
+    throw new Error(`Order ${orderId} not found in Supabase.`);
+  }
+  const order = fetchRes.data[0];
+
+  if (order.status !== "cancelled" || !order.previous_status) {
+    throw new Error("Order is not cancellled with a stored previous_status.");
+  }
+
+  const prevStatus = order.previous_status;
+  const prevWc = order.previous_wc_status || "pending";
+
+  // Woo restore
+  if (WC_USER && WC_PASS) {
+    try {
+      await axios.put(
+        `https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`,
+        { status: prevWc },
+        { auth: { username: WC_USER, password: WC_PASS } }
+      );
+    } catch (e) {
+      console.error(
+        "Woo restore failed:",
+        e.response?.data || e.message
+      );
+    }
+  }
+
+  // Supabase restore
+  await axios.patch(
+    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
+      orderId
+    )}`,
+    {
+      status: prevStatus,
+      previous_status: null,
+      previous_wc_status: null
+    },
+    { headers: sbHeaders }
+  );
 }
 
 /* ---------------------------------------------------
@@ -415,8 +529,6 @@ if (bot) {
 /* ---------------------------------------------------
    /track <order_id> <phone> <tracking_id>
    - Mark tracking_sent=true, status=completed in Supabase
-   - (Currently only replies in Telegram; WA sending can be
-     automated later via AutoJS if you want)
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/track\s+(\S+)\s+(\S+)\s+(\S+)/i, async (msg, match) => {
@@ -505,25 +617,10 @@ if (bot) {
 /* ---------------------------------------------------
    /today
    - Show today's paid orders
-   - If /clear_today used earlier today, show "cleared"
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/today/i, async (msg) => {
     const chatId = msg.chat.id;
-
-    let todayKey;
-    try {
-      todayKey = DateTime.now().setZone(TIMEZONE).toISODate();
-    } catch (_) {
-      todayKey = new Date().toISOString().slice(0, 10);
-    }
-
-    if (clearedTodayDate === todayKey) {
-      return bot.sendMessage(
-        chatId,
-        "✅ Today's orders were cleared from /today view."
-      );
-    }
 
     try {
       const start = DateTime.now()
@@ -561,23 +658,60 @@ if (bot) {
 
 /* ---------------------------------------------------
    /clear_today
-   - Mark today's date cleared (only affects /today output)
-   - Does NOT change Supabase data
+   - Show today's paid orders with buttons to cancel them
+   - Cancels in Woo + Supabase using cancelOrderEverywhere
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/clear_today/i, async (msg) => {
-    let todayKey;
-    try {
-      todayKey = DateTime.now().setZone(TIMEZONE).toISODate();
-    } catch (_) {
-      todayKey = new Date().toISOString().slice(0, 10);
-    }
+    const chatId = msg.chat.id;
 
-    clearedTodayDate = todayKey;
-    await bot.sendMessage(
-      msg.chat.id,
-      "✅ Cleared today's paid orders from /today view (DB not changed)."
-    );
+    try {
+      const start = DateTime.now()
+        .setZone(TIMEZONE)
+        .startOf("day")
+        .toUTC()
+        .toISO();
+
+      const r = await axios.get(
+        `${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(
+          start
+        )}&status=eq.paid&select=order_id,name,amount`,
+        { headers: sbHeaders }
+      );
+
+      const rows = r.data || [];
+      if (!rows.length) {
+        return bot.sendMessage(chatId, "📭 No paid orders to clear today.");
+      }
+
+      let text = "📅 Today’s Paid Orders (tap to cancel):\n\n";
+      const buttons = [];
+
+      rows.forEach((o, idx) => {
+        text += `${idx + 1}. ${o.name} (${o.order_id}) • ₹${o.amount}\n`;
+        buttons.push([
+          {
+            text: `❌ Cancel ${o.order_id}`,
+            callback_data: `clear_cancel:${o.order_id}`
+          }
+        ]);
+      });
+
+      // optional: cancel all
+      buttons.push([
+        {
+          text: "❌ Cancel ALL paid today",
+          callback_data: "clear_cancel_all:today"
+        }
+      ]);
+
+      await bot.sendMessage(chatId, text, {
+        reply_markup: { inline_keyboard: buttons }
+      });
+    } catch (e) {
+      console.error("/clear_today error:", e.response?.data || e.message);
+      await bot.sendMessage(chatId, "⚠️ Failed to load today's paid orders.");
+    }
   });
 }
 
@@ -637,6 +771,34 @@ if (bot) {
     await bot.sendMessage(chatId, "📅 Choose a date to view paid orders:", {
       reply_markup: { inline_keyboard: buttons }
     });
+  });
+}
+
+/* ---------------------------------------------------
+   /restore <order_id>
+   - Restore cancelled order using previous_status + previous_wc_status
+--------------------------------------------------- */
+if (bot) {
+  bot.onText(/\/restore\s+(.+)/i, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const orderId = match[1]?.trim();
+    if (!orderId) {
+      return bot.sendMessage(chatId, "Usage: /restore <order_id>");
+    }
+
+    try {
+      await restoreOrderEverywhere(orderId);
+      await bot.sendMessage(
+        chatId,
+        `♻ Order ${orderId} restored in Supabase + WooCommerce.`
+      );
+    } catch (e) {
+      console.error("/restore error:", e.response?.data || e.message);
+      await bot.sendMessage(
+        chatId,
+        "⚠️ Failed to restore order. Maybe it is not cancelled or has no previous_status."
+      );
+    }
   });
 }
 
@@ -740,40 +902,45 @@ if (bot) {
       } else if (data.startsWith("order_cancel:")) {
         const orderId = data.split(":")[1];
 
-        // cancel in WooCommerce
-        if (WC_USER && WC_PASS) {
-          try {
-            await axios.put(
-              `https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`,
-              { status: "cancelled" },
-              { auth: { username: WC_USER, password: WC_PASS } }
-            );
-          } catch (e) {
-            console.error(
-              "Woo cancel failed:",
-              e.response?.data || e.message
-            );
-          }
-        }
-
-        // cancel in Supabase
-        await axios.patch(
-          `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-            orderId
-          )}`,
-          {
-            status: "cancelled",
-            next_message: null,
-            reminder_24_sent: true,
-            reminder_48_sent: true,
-            reminder_72_sent: true
-          },
-          { headers: sbHeaders }
-        );
+        await cancelOrderEverywhere(orderId);
 
         await bot.sendMessage(
           chatId,
           `❌ Order ${orderId} cancelled in WooCommerce + Supabase.`
+        );
+      }
+
+      // ----- /clear_today cancel buttons -----
+      else if (data.startsWith("clear_cancel:")) {
+        const orderId = data.split(":")[1];
+        await cancelOrderEverywhere(orderId);
+        await bot.sendMessage(
+          chatId,
+          `❌ Order ${orderId} cancelled (Woo + Supabase).`
+        );
+      } else if (data.startsWith("clear_cancel_all:")) {
+        // cancel all today's paid orders
+        const start = DateTime.now()
+          .setZone(TIMEZONE)
+          .startOf("day")
+          .toUTC()
+          .toISO();
+
+        const r = await axios.get(
+          `${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(
+            start
+          )}&status=eq.paid&select=order_id`,
+          { headers: sbHeaders }
+        );
+
+        const rows = r.data || [];
+        for (const o of rows) {
+          await cancelOrderEverywhere(o.order_id);
+        }
+
+        await bot.sendMessage(
+          chatId,
+          `❌ Cancelled ${rows.length} paid orders for today (Woo + Supabase).`
         );
       }
 
