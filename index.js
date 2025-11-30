@@ -33,17 +33,20 @@ const sbHeaders = {
 
 // ---------------- Telegram ----------------
 let bot = null;
+let todayPaidList = [];  // 🔥 New storage
+
 if (TELEGRAM_TOKEN) {
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
   console.log("🤖 Telegram Bot Ready");
 }
 
-// Helpers
 function nowISO() { return new Date().toISOString(); }
 function hoursSince(iso) { return (Date.now() - new Date(iso).getTime()) / 3600000; }
 
+
 // ---------------- HEALTH ----------------
 app.get("/", (req, res) => res.send("🔥 WC → Supabase Automation Live"));
+
 
 // ---------------- WEBHOOK INSERT ----------------
 app.post("/woocommerce-webhook", async (req, res) => {
@@ -55,15 +58,15 @@ app.post("/woocommerce-webhook", async (req, res) => {
     let qty = 1;
 
     try {
-      const meta = order.line_items[0]?.meta;
+      const meta = order.line_items?.[0]?.meta;
       if (meta) {
-        const s = meta.find(m => m.key === "pa_sizes" || (m.label && m.label.toLowerCase().includes("size")));
+        const s = meta.find(m => m.key === "pa_sizes" || m.label?.toLowerCase()?.includes("size"));
         if (s) size = s.value;
       }
-      qty = order.total_line_items_quantity || order.line_items[0]?.quantity;
+      qty = order.total_line_items_quantity || order.line_items?.[0]?.quantity || 1;
     } catch (_) {}
 
-    const mapped = {
+    await axios.post(`${SUPABASE_URL}/rest/v1/orders`, {
       order_id: String(order.id),
       name: order.billing_address.first_name,
       phone: order.billing_address.phone,
@@ -79,42 +82,33 @@ app.post("/woocommerce-webhook", async (req, res) => {
 
       status: "pending_payment",
       created_at: nowISO(),
-
       message_sent: false,
-      next_message: "reminder_24h",
-      reminder_24_sent: false,
-      reminder_48_sent: false,
-      reminder_72_sent: false,
-      discounted_amount: null,
-      supplier_sent: false,
-      paid_at: null,
       paid_message_pending: false,
-      resend_qr_pending: false,
-      tracking_sent: false
-    };
+      resend_qr_pending: false
+    }, { headers: sbHeaders });
 
-    await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
-
-    return res.send("OK");
+    res.send("OK");
   } catch (err) {
     console.error(err.message);
     res.send("ERR");
   }
 });
 
-// ---------------- /paid ----------------
+
+// ---------------- 📌 /paid COMMAND ----------------
 if (bot) {
   bot.onText(/\/paid\s+(.+)/i, async (msg, match) => {
+
     const chatId = msg.chat.id;
     const orderId = match[1]?.trim();
-
     if (!orderId) return bot.sendMessage(chatId, "❌ Use: `/paid <order_id>`", { parse_mode: "Markdown" });
 
     try {
-      const fetch = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}&select=*`, { headers: sbHeaders });
-      if (!fetch.data.length) return bot.sendMessage(chatId, "Order not found.");
+      // fetch
+      const { data } = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}&select=*`, { headers: sbHeaders });
+      if (!data.length) return bot.sendMessage(chatId, "❌ Order not found.");
 
-      const order = fetch.data[0];
+      const o = data[0];
 
       // update WooCommerce
       await axios.put(
@@ -123,153 +117,90 @@ if (bot) {
         { auth: { username: WC_USER, password: WC_PASS } }
       );
 
-      // mark Supabase
-      await axios.patch(
-        `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}`,
-        {
-          status: "paid",
-          paid_at: nowISO(),
-          paid_message_pending: true,
-          reminder_24_sent: true,
-          reminder_48_sent: true,
-          reminder_72_sent: true,
-          next_message: null
-        },
-        { headers: sbHeaders }
-      );
+      // update Supabase status
+      await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}`, {
+        status: "paid",
+        paid_at: nowISO(),
+        paid_message_pending: true
+      }, { headers: sbHeaders });
 
-      // Supplier format
-      const supplier = `📦 *NEW PAID ORDER*\n\nName: ${order.name}\nPhone: ${order.phone}\nAddress: ${order.address}, ${order.state} - ${order.pincode}\n\nProduct: ${order.product}\nSize: ${order.size}\nQty: ${order.quantity}\nSKU: ${order.sku}`;
 
-      if (SUPPLIER_CHAT_ID) bot.sendMessage(SUPPLIER_CHAT_ID, supplier, { parse_mode: "Markdown" });
-      bot.sendMessage(chatId, supplier, { parse_mode: "Markdown" });
+      // ---------------- Supplier Format EXACT ----------------
+      const text = `
+📦 *NEW PAID ORDER*
 
-      bot.sendMessage(chatId, `✅ Order *${orderId}* marked paid.\nCustomer reply will be sent.`, { parse_mode: "Markdown" });
+From:
+Vision Jerseys 
++91 93279 05965
+
+To:
+Name: ${o.name}
+Address: ${o.address}
+State: ${o.state}
+Pincode: ${o.pincode}
+Phone: ${o.phone}
+SKU ID: ${o.sku}
+
+Product: ${o.product}
+Size: ${o.size}
+Quantity: ${o.quantity}
+
+Shipment Mode: Normal
+_________`;
+
+      if (SUPPLIER_CHAT_ID) bot.sendMessage(SUPPLIER_CHAT_ID, text, { parse_mode: "Markdown" });
+      bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
+
+
+      // ---------------- add to TODAY list ----------------
+      const todayDate = DateTime.now().setZone(TIMEZONE).toFormat("dd-MM-yyyy");
+      todayPaidList.push({ name: o.name, id: orderId });
+
+      let formattedList = `🌼 *${todayDate} Orders*\n\n`;
+      todayPaidList.forEach((x, i) => {
+        formattedList += `${i + 1}. ${x.name} (${x.id}) 📦  # ${todayDate}\n`;
+      });
+
+      bot.sendMessage(chatId, formattedList, { parse_mode: "Markdown" });
+
+
+      return bot.sendMessage(chatId, `✔ Payment logged. AutoJS will now send customer thank-you.`);
 
     } catch (err) {
-      bot.sendMessage(chatId, "⚠️ Something went wrong.");
       console.error(err.response?.data || err.message);
+      bot.sendMessage(chatId, "⚠ Error while processing order.");
     }
   });
 }
 
-// ---------------- /resend_qr ----------------
-if (bot) {
-  bot.onText(/\/resend_qr\s+(.+)/i, async (msg, match) => {
-    const id = match[1]?.trim();
-    if (!id) return bot.sendMessage(msg.chat.id, "Usage: /resend_qr <order_id>");
 
-    await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${id}`, { resend_qr_pending: true }, { headers: sbHeaders });
-
-    bot.sendMessage(msg.chat.id, `🔁 QR resend triggered for ${id}`);
-  });
-}
-
-// ---------------- /track ----------------
-if (bot) {
-  bot.onText(/\/track\s+(\S+)\s+(\S+)\s+(\S+)/i, async (msg, match) => {
-    const [_, orderId, phone, tracking] = match;
-
-    await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${orderId}`, {
-      tracking_sent: true,
-      status: "completed"
-    }, { headers: sbHeaders });
-
-    bot.sendMessage(msg.chat.id, `📦 Tracking sent:\nID: *${tracking}*\nPhone: ${phone}`, { parse_mode: "Markdown" });
-
-    bot.sendMessage(msg.chat.id, `
-📦 Track Your India Post Order
-
-👉 Tracking ID: *${tracking}*
-
-🔗 https://myspeedpost.com/
-    `, { parse_mode: "Markdown" });
-
-  });
-}
-
-// ---------------- /export_today ----------------
-if (bot) {
-  bot.onText(/\/export_today/i, async (msg) => {
-    const chat = msg.chat.id;
-
-    const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
-
-    const orders = await axios.get(
-      `${SUPABASE_URL}/rest/v1/orders?created_at=gte.${start}&select=order_id,name,phone,amount,status`,
-      { headers: sbHeaders }
-    );
-
-    if (!orders.data.length) return bot.sendMessage(chat, "📭 No orders today.");
-
-    let text = "📄 Today Orders:\n\n";
-    orders.data.forEach(o => text += `• ${o.order_id} | ${o.name} | ₹${o.amount} | ${o.status}\n`);
-
-    bot.sendMessage(chat, text);
-  });
-}
-
-// ---------------- /today quick stats ----------------
-bot?.onText(/\/today/i, async msg => {
-  const chat = msg.chat.id;
-  const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
-
-  const r = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${start}&status=eq.paid&select=*`,
-    { headers: sbHeaders }
-  );
-
-  if (!r.data.length) return bot.sendMessage(chat, "📭 No paid orders yet.");
-
-  let t = `📅 *Today’s Paid Orders*\n\n`;
-  r.data.forEach(o => t += `• ${o.order_id} | ${o.name} | ₹${o.amount}\n`);
-  bot.sendMessage(chat, t, { parse_mode: "Markdown" });
+// ---------------- RESET TODAY LIST ----------------
+bot?.onText(/\/reset_today/i, msg => {
+  todayPaidList = [];
+  bot.sendMessage(msg.chat.id, "🧹 Today order list cleared.");
 });
 
-// ---------------- CRON / REMINDERS ----------------
-app.get("/cron-check", async (req, res) => {
-  try {
-    const orders = await axios.get(
-      `${SUPABASE_URL}/rest/v1/orders?status=eq.pending_payment&select=*`,
-      { headers: sbHeaders }
-    );
 
-    for (const o of orders.data) {
-      const h = hoursSince(o.created_at);
+// ---------------- MENU ----------------
+bot?.onText(/\/menu/i, msg => {
+  bot.sendMessage(msg.chat.id, `
+📌 *VisionsJersey Menu*
 
-      if (!o.reminder_24_sent && h >= 24)
-        await patch(o.order_id, { reminder_24_sent: true, next_message: "reminder_48h" });
+🧾 Orders:
+• /paid <order_id> — Mark paid + share supplier format + add to today's log  
+• /reset_today — Clear today's paid list
 
-      if (!o.reminder_48_sent && h >= 48)
-        await patch(o.order_id, { reminder_48_sent: true, discounted_amount: o.amount - 30, next_message: "reminder_72h" });
+📦 Tracking:
+• /track <order_id> <phone> <trackingID>
 
-      if (!o.reminder_72_sent && h >= 72)
-        await patch(o.order_id, { reminder_72_sent: true, status: "cancelled" });
-    }
+🔁 Other:
+• /resend_qr <order_id> — Trigger QR resend  
+• /export_today — Export full today orders  
+• /today — Show today's paid orders  
 
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.send("ERR");
-  }
+`, { parse_mode: "Markdown" });
 });
 
-// ---------------- Night Summary ----------------
-app.get("/night-summary", async (req, res) => {
-  if (!bot || !SUPPLIER_CHAT_ID) return res.send("BOT DISABLED");
-
-  const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
-
-  const paid = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${start}&select=*`,
-    { headers: sbHeaders }
-  );
-
-  let report = `📊 Daily Summary\nPaid Orders: ${paid.data.length}`;
-
-  bot.sendMessage(SUPPLIER_CHAT_ID, report);
-  res.send("OK");
-});
 
 // ---------------- LISTEN ----------------
 const PORT = process.env.PORT || 10000;
