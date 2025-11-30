@@ -1,5 +1,5 @@
-// index.js — VisionsJersey automation (Advanced Cancel + Restore)
-// 2025-11 - Updated by assistant (implements Version B cancel/restore)
+// index.js — VisionsJersey automation (Final: /paid saves today's paid orders A1)
+// 2025-11 - Finalized: saves paid items to paid_order_items table (day = today)
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -167,7 +167,7 @@ if (bot) {
 - WooCommerce → processing
 - Supabase → status paid + thank-you pending
 - Sends supplier format
-- Sends today's paid orders list
+- Saves paid item to paid_order_items (today) and sends today's paid list
 
 /resend_qr <order_id>
 - Trigger AutoJS to resend QR + pending message
@@ -195,6 +195,7 @@ Notes:
 
 /* ---------------------------------------------------
    Core: mark paid logic (shared)
+   (Also: insert into paid_order_items table using A1 — day = today)
 --------------------------------------------------- */
 async function handleMarkPaid(chatId, orderId) {
   console.log("handleMarkPaid:", orderId);
@@ -248,7 +249,30 @@ async function handleMarkPaid(chatId, orderId) {
     // continue
   }
 
-  // 4) Send supplier format (plain text)
+  // 4) Insert into paid_order_items (day = today's date in TIMEZONE)
+  try {
+    let dayKey;
+    try {
+      dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); // YYYY-MM-DD
+    } catch (_) {
+      dayKey = new Date().toISOString().slice(0, 10);
+    }
+
+    const paidItem = {
+      day: dayKey,
+      order_id: order.order_id || String(orderId),
+      name: order.name || "",
+      amount: order.amount || 0,
+      created_at: nowISO()
+    };
+
+    // insert row
+    await axios.post(`${SUPABASE_URL}/rest/v1/paid_order_items`, paidItem, { headers: sbHeaders });
+  } catch (e) {
+    console.error("Insert paid_order_items failed:", e.response?.data || e.message || e);
+  }
+
+  // 5) Send supplier format (plain text)
   const supplierText =
 `📦 NEW PAID ORDER
 
@@ -278,46 +302,46 @@ Shipment Mode: Normal`;
     console.error("failed to send supplier message:", e.response?.data || e.message);
   }
 
-  // 5) Build today's paid list and send (date formatted)
-  let startOfTodayISO;
+  // 6) Build today's paid list from paid_order_items (primary source)
+  let listText = "";
   try {
-    const start = DateTime.now().setZone(TIMEZONE).startOf("day");
-    startOfTodayISO = start.toUTC().toISO();
-  } catch (_) {
-    startOfTodayISO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  }
+    let dayKey;
+    try {
+      dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); // YYYY-MM-DD
+    } catch (_) {
+      dayKey = new Date().toISOString().slice(0, 10);
+    }
 
-  let paidRows = [];
-  try {
-    const paidRes = await axios.get(
-      `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(startOfTodayISO)}&select=order_id,name,amount,paid_at,hidden_from_today`,
+    const paidItemsRes = await axios.get(
+      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=order_id,name,amount,created_at`,
       { headers: sbHeaders }
     );
-    paidRows = paidRes.data || [];
-    // exclude hidden_from_today ones
-    paidRows = paidRows.filter((r) => !r.hidden_from_today);
+    const saved = paidItemsRes.data || [];
+
+    let headerDate;
+    try {
+      headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd");
+    } catch (_) {
+      headerDate = new Date().toISOString().slice(0, 10);
+    }
+
+    listText = `${headerDate} orders 🌼\n\n`;
+    if (!saved.length) {
+      listText += "No paid orders for today yet.";
+    } else {
+      saved.forEach((r, idx) => {
+        // show day (dd/LL/yyyy) as requested
+        let dateStr = r.created_at || "";
+        try {
+          dateStr = DateTime.fromISO(r.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
+        } catch (_) {}
+        listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) 📦 # ${dateStr}\n`;
+      });
+    }
   } catch (e) {
-    console.error("failed to fetch paidRows:", e.response?.data || e.message);
-  }
-
-  let headerDate;
-  try {
-    headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd");
-  } catch (_) {
-    headerDate = new Date().toISOString().slice(0, 10);
-  }
-
-  let listText = `${headerDate} orders 🌼\n\n`;
-  if (!paidRows.length) {
-    listText += "No paid orders for today yet.";
-  } else {
-    paidRows.forEach((r, idx) => {
-      let dateStr = r.paid_at || "";
-      try {
-        dateStr = DateTime.fromISO(r.paid_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
-      } catch (_) {}
-      listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) 📦 # ${dateStr}\n`;
-    });
+    console.error("Failed to build today's list from paid_order_items:", e.response?.data || e.message);
+    // fallback: minimal message
+    listText = "Today's paid list couldn't be loaded from DB.";
   }
 
   await safeSend(chatId, listText);
@@ -477,12 +501,17 @@ if (bot) {
     }
 
     try {
-      const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(start)}&status=eq.paid&select=order_id,name,amount,hidden_from_today`, { headers: sbHeaders });
-      const rows = (r.data || []).filter((x) => !x.hidden_from_today);
+      // use paid_order_items table (primary source) to list today's paid
+      const r = await axios.get(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,amount,created_at`,
+        { headers: sbHeaders }
+      );
+      const rows = (r.data || []).filter((x) => true);
       if (!rows.length) return safeSend(chatId, "📭 No paid orders yet today.");
       let text = "📅 Today’s Paid Orders\n\n";
-      rows.forEach((o) => { text += `• ${o.order_id} | ${o.name || ""} | ₹${o.amount || 0}\n`; });
+      rows.forEach((o) => {
+        text += `• ${o.order_id} | ${o.name || ""} | ₹${o.amount || 0}\n`;
+      });
       await safeSend(chatId, text);
     } catch (e) {
       console.error("/today error:", e.response?.data || e.message);
@@ -549,6 +578,7 @@ if (bot) {
        order_cancel_action:<id>:only_list
        order_cancel_action:<id>:full
        order_cancel_action:<id>:restore
+   - paidorders callbacks now read paid_order_items table first
 --------------------------------------------------- */
 if (bot) {
   bot.on("callback_query", async (query) => {
@@ -690,22 +720,47 @@ if (bot) {
           end = new Date(d.getTime() + 24 * 3600000).toISOString();
         }
 
-        const r = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&paid_at=lt.${encodeURIComponent(end)}&select=order_id,name,amount,paid_at,hidden_from_today`, { headers: sbHeaders });
-        let rows = r.data || [];
-        rows = rows.filter((x) => !x.hidden_from_today);
+        // Primary source: paid_order_items table
+        try {
+          const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dateKey)}&select=order_id,name,amount,created_at`, { headers: sbHeaders });
+          let rows = r.data || [];
 
-        let header = `${dateKey} paid orders 🌼\n\n`;
-        if (!rows.length) header += "No paid orders on this date.";
-        else {
-          rows.forEach((o, idx) => {
-            let dateStr = o.paid_at;
-            try {
-              dateStr = DateTime.fromISO(o.paid_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
-            } catch (_) {}
-            header += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦 # ${dateStr}\n`;
-          });
+          let header = `${dateKey} paid orders 🌼\n\n`;
+          if (!rows.length) {
+            header += "No paid orders on this date.";
+          } else {
+            rows.forEach((o, idx) => {
+              let dateStr = o.created_at;
+              try {
+                dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
+              } catch (_) {}
+              header += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦 # ${dateStr}\n`;
+            });
+          }
+          await safeSend(chatId, header);
+        } catch (e) {
+          console.error("paidorders fetch error (paid_order_items):", e.response?.data || e.message);
+          // fallback to orders table if needed
+          try {
+            const r2 = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&paid_at=lt.${encodeURIComponent(end)}&select=order_id,name,amount,paid_at,hidden_from_today`, { headers: sbHeaders });
+            let rows = (r2.data || []).filter((x) => !x.hidden_from_today);
+            let header = `${dateKey} paid orders 🌼\n\n`;
+            if (!rows.length) header += "No paid orders on this date.";
+            else {
+              rows.forEach((o, idx) => {
+                let dateStr = o.paid_at;
+                try {
+                  dateStr = DateTime.fromISO(o.paid_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
+                } catch (_) {}
+                header += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦 # ${dateStr}\n`;
+              });
+            }
+            await safeSend(chatId, header);
+          } catch (e2) {
+            console.error("paidorders fallback error:", e2.response?.data || e2.message);
+            await safeSend(chatId, "⚠️ Failed to fetch paid orders for that date.");
+          }
         }
-        await safeSend(chatId, header);
       } else {
         // unknown callback - ack
         await bot.answerCallbackQuery(query.id, { text: "Action received" });
