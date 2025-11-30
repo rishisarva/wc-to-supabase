@@ -1,3 +1,5 @@
+// index.js — VisionsJersey automation (Advanced Cancel + Restore)
+// 2025-11 - Updated by assistant (implements Version B cancel/restore)
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -20,7 +22,7 @@ const WC_USER = process.env.WC_KEY || "";
 const WC_PASS = process.env.WC_SECRET || "";
 
 if (!SUPABASE_URL || !SUPABASE_ANON) {
-  console.error("❌ Missing Supabase credentials");
+  console.error("❌ Missing SUPABASE_URL or SUPABASE_ANON environment variable.");
   process.exit(1);
 }
 
@@ -31,13 +33,17 @@ const sbHeaders = {
   Prefer: "return=representation"
 };
 
+// in-memory flag to "clear" today's orders from /today (does NOT touch DB)
+let clearedTodayDate = null;
+
 // ---------------- Telegram ----------------
 let bot = null;
 if (TELEGRAM_TOKEN) {
+  // polling mode (works on Render; be sure only a single instance is running)
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-  console.log("🤖 Telegram Bot Ready");
+  console.log("🤖 Telegram Bot Ready (polling)");
 } else {
-  console.log("⚠️ TELEGRAM_TOKEN missing, bot disabled");
+  console.warn("⚠️ TELEGRAM_TOKEN missing — bot disabled.");
 }
 
 // Helpers
@@ -47,13 +53,24 @@ function nowISO() {
 function hoursSince(iso) {
   return (Date.now() - new Date(iso).getTime()) / 3600000;
 }
-
-// small helper for cron patches
 async function patch(order_id, patchBody) {
   const pUrl = `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
     order_id
   )}`;
   return axios.patch(pUrl, patchBody, { headers: sbHeaders });
+}
+
+// Small safe sender — uses plain text to avoid markdown parse errors
+async function safeSend(chatId, text) {
+  try {
+    return await bot.sendMessage(chatId, text);
+  } catch (e) {
+    console.error("safeSend error:", e.response?.data || e.message || e);
+    // fallback: try without extra options
+    try {
+      return await bot.sendMessage(chatId, String(text));
+    } catch (_) {}
+  }
 }
 
 // ---------------- HEALTH ----------------
@@ -67,7 +84,6 @@ app.post("/woocommerce-webhook", async (req, res) => {
 
     let size = "";
     let qty = 1;
-
     try {
       const meta = order.line_items[0]?.meta;
       if (meta) {
@@ -86,16 +102,16 @@ app.post("/woocommerce-webhook", async (req, res) => {
 
     const mapped = {
       order_id: String(order.id),
-      name: order.billing_address.first_name,
-      phone: order.billing_address.phone,
-      email: order.billing_address.email,
-      amount: Number(order.total),
-      product: order.line_items[0].name,
+      name: order.billing_address?.first_name || "",
+      phone: order.billing_address?.phone || "",
+      email: order.billing_address?.email || "",
+      amount: Number(order.total) || 0,
+      product: order.line_items[0]?.name || "",
       sku: order.line_items[0]?.sku || "",
       size,
-      address: order.billing_address.address_1,
-      state: order.billing_address.state,
-      pincode: order.billing_address.postcode,
+      address: order.billing_address?.address_1 || "",
+      state: order.billing_address?.state || "",
+      pincode: order.billing_address?.postcode || "",
       quantity: qty,
 
       status: "pending_payment",
@@ -112,22 +128,24 @@ app.post("/woocommerce-webhook", async (req, res) => {
       paid_message_pending: false,
       resend_qr_pending: false,
       tracking_sent: false,
+      hidden_from_today: false,
 
-      // for cancel + restore
+      // previous_* fields are null by default and filled on full cancel
       previous_status: null,
-      previous_wc_status: null
+      previous_paid_at: null,
+      previous_amount: null,
+      previous_next_message: null,
+      previous_reminder_24_sent: null,
+      previous_reminder_48_sent: null,
+      previous_reminder_72_sent: null
     };
 
-    await axios.post(
-      `${SUPABASE_URL}/rest/v1/orders`,
-      mapped,
-      { headers: sbHeaders }
-    );
+    await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
 
     return res.send("OK");
   } catch (err) {
     console.error("WEBHOOK ERROR:", err.response?.data || err.message);
-    res.send("ERR");
+    return res.status(200).send("ERR");
   }
 });
 
@@ -137,7 +155,6 @@ app.post("/woocommerce-webhook", async (req, res) => {
 if (bot) {
   bot.onText(/\/menu/i, async (msg) => {
     const chatId = msg.chat.id;
-
     const text =
 `VisionsJersey Bot Commands:
 
@@ -156,8 +173,7 @@ if (bot) {
 - Trigger AutoJS to resend QR + pending message
 
 /track <order_id> <phone> <tracking_id>
-- Mark order completed in Supabase
-- Sends tracking info reply (here in Telegram)
+- Mark order completed in Supabase and reply tracking text
 
 /export_today
 - List today's orders (all statuses)
@@ -166,155 +182,35 @@ if (bot) {
 - Show today's PAID orders
 
 /clear_today
-- Show today's paid orders with buttons to cancel (Woo + Supabase)
+- Hide today's paid orders from /today (view only)
 
 /paidorders
 - Show buttons for paid orders by date (3 days before, today, 3 days after)
 
-/restore <order_id>
-- Restore a cancelled order (Supabase + Woo status)
-`;
-
-    try {
-      await bot.sendMessage(chatId, text);
-    } catch (e) {
-      console.error("/menu error:", e.message);
-    }
+Notes:
+- Cancel button opens a submenu: Cancel only in list, Cancel in Woo+Supabase, Restore (if available).`;
+    await safeSend(chatId, text);
   });
 }
 
 /* ---------------------------------------------------
-   Helper: cancel order everywhere (Woo + Supabase)
-   and store previous_status + previous_wc_status
---------------------------------------------------- */
-async function cancelOrderEverywhere(orderId) {
-  // 1) Fetch Supabase order
-  const fetchRes = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-      orderId
-    )}&select=*`,
-    { headers: sbHeaders }
-  );
-  if (!fetchRes.data.length) {
-    throw new Error(`Order ${orderId} not found in Supabase.`);
-  }
-  const order = fetchRes.data[0];
-
-  // guess previous Woo status from Supabase status
-  let prevWcStatus = "pending";
-  if (order.status === "paid") prevWcStatus = "processing";
-  else if (order.status === "pending_payment") prevWcStatus = "pending";
-  else if (order.status === "completed") prevWcStatus = "completed";
-
-  // 2) Cancel in WooCommerce
-  if (WC_USER && WC_PASS) {
-    try {
-      await axios.put(
-        `https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`,
-        { status: "cancelled" },
-        { auth: { username: WC_USER, password: WC_PASS } }
-      );
-    } catch (e) {
-      console.error(
-        "Woo cancel failed:",
-        e.response?.data || e.message
-      );
-    }
-  }
-
-  // 3) Cancel in Supabase + store previous statuses
-  await axios.patch(
-    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-      orderId
-    )}`,
-    {
-      status: "cancelled",
-      next_message: null,
-      reminder_24_sent: true,
-      reminder_48_sent: true,
-      reminder_72_sent: true,
-      previous_status: order.status || null,
-      previous_wc_status: prevWcStatus
-    },
-    { headers: sbHeaders }
-  );
-}
-
-/* ---------------------------------------------------
-   Helper: restore order (Supabase + Woo) using previous_status
---------------------------------------------------- */
-async function restoreOrderEverywhere(orderId) {
-  // fetch from Supabase
-  const fetchRes = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-      orderId
-    )}&select=*`,
-    { headers: sbHeaders }
-  );
-  if (!fetchRes.data.length) {
-    throw new Error(`Order ${orderId} not found in Supabase.`);
-  }
-  const order = fetchRes.data[0];
-
-  if (order.status !== "cancelled" || !order.previous_status) {
-    throw new Error("Order is not cancellled with a stored previous_status.");
-  }
-
-  const prevStatus = order.previous_status;
-  const prevWc = order.previous_wc_status || "pending";
-
-  // Woo restore
-  if (WC_USER && WC_PASS) {
-    try {
-      await axios.put(
-        `https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`,
-        { status: prevWc },
-        { auth: { username: WC_USER, password: WC_PASS } }
-      );
-    } catch (e) {
-      console.error(
-        "Woo restore failed:",
-        e.response?.data || e.message
-      );
-    }
-  }
-
-  // Supabase restore
-  await axios.patch(
-    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-      orderId
-    )}`,
-    {
-      status: prevStatus,
-      previous_status: null,
-      previous_wc_status: null
-    },
-    { headers: sbHeaders }
-  );
-}
-
-/* ---------------------------------------------------
-   Shared: core "mark paid" logic reused by
-   - /paid command
-   - inline "Mark Paid" button
+   Core: mark paid logic (shared)
 --------------------------------------------------- */
 async function handleMarkPaid(chatId, orderId) {
   console.log("handleMarkPaid:", orderId);
 
-  // 1) Fetch order from Supabase
+  // 1) Fetch order
   const fetchRes = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-      orderId
-    )}&select=*`,
+    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`,
     { headers: sbHeaders }
   );
   if (!fetchRes.data.length) {
-    await bot.sendMessage(chatId, `❌ Order ${orderId} not found in Supabase.`);
+    await safeSend(chatId, `❌ Order ${orderId} not found in Supabase.`);
     return;
   }
   const order = fetchRes.data[0];
 
-  // 2) Update WooCommerce status → processing
+  // 2) Update WooCommerce -> processing (best-effort)
   if (WC_USER && WC_PASS) {
     try {
       await axios.put(
@@ -324,31 +220,35 @@ async function handleMarkPaid(chatId, orderId) {
       );
       console.log("✔ WooCommerce updated to processing:", orderId);
     } catch (e) {
-      console.error(
-        "WooCommerce update failed:",
-        e.response?.data || e.message
-      );
+      console.error("WooCommerce update failed:", e.response?.data || e.message);
+      // continue anyway
     }
   } else {
-    console.warn("WC_KEY / WC_SECRET not set in Render env.");
+    console.warn("WC_KEY / WC_SECRET not configured in environment.");
   }
 
-  // 3) Update Supabase → paid
-  await axios.patch(
-    `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`,
-    {
-      status: "paid",
-      paid_at: nowISO(),
-      paid_message_pending: true,
-      reminder_24_sent: true,
-      reminder_48_sent: true,
-      reminder_72_sent: true,
-      next_message: null
-    },
-    { headers: sbHeaders }
-  );
+  // 3) Update Supabase -> mark paid + set paid_message_pending so AutoJS sends thank-you
+  try {
+    await axios.patch(
+      `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`,
+      {
+        status: "paid",
+        paid_at: nowISO(),
+        paid_message_pending: true,
+        reminder_24_sent: true,
+        reminder_48_sent: true,
+        reminder_72_sent: true,
+        next_message: null,
+        hidden_from_today: false // remove any hiding when marking paid
+      },
+      { headers: sbHeaders }
+    );
+  } catch (e) {
+    console.error("Supabase patch (paid) failed:", e.response?.data || e.message);
+    // continue
+  }
 
-  // 4) Supplier format (exact shape you provided)
+  // 4) Send supplier format (plain text)
   const supplierText =
 `📦 NEW PAID ORDER
 
@@ -357,43 +257,48 @@ Vision Jerseys
 +91 93279 05965
 
 To:
-Name: ${order.name}
-Address: ${order.address}
-State: ${order.state}
-Pincode: ${order.pincode}
-Phone: ${order.phone}
-SKU ID: ${order.sku}
+Name: ${order.name || ""}
+Address: ${order.address || ""}
+State: ${order.state || ""}
+Pincode: ${order.pincode || ""}
+Phone: ${order.phone || ""}
+SKU ID: ${order.sku || ""}
 
-Product: ${order.product}
-Size: ${order.size}
-Quantity: ${order.quantity}
+Product: ${order.product || ""}
+Size: ${order.size || ""}
+Quantity: ${order.quantity || ""}
 
 Shipment Mode: Normal`;
 
-  // send supplier format to supplier & you
-  if (SUPPLIER_CHAT_ID) {
-    await bot.sendMessage(SUPPLIER_CHAT_ID, supplierText);
+  // send to supplier + admin chat
+  try {
+    if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
+    await safeSend(chatId, supplierText);
+  } catch (e) {
+    console.error("failed to send supplier message:", e.response?.data || e.message);
   }
-  await bot.sendMessage(chatId, supplierText);
 
-  // 5) Today's paid orders list
+  // 5) Build today's paid list and send (date formatted)
   let startOfTodayISO;
   try {
     const start = DateTime.now().setZone(TIMEZONE).startOf("day");
     startOfTodayISO = start.toUTC().toISO();
   } catch (_) {
-    startOfTodayISO = new Date(
-      Date.now() - 24 * 60 * 60 * 1000
-    ).toISOString();
+    startOfTodayISO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   }
 
-  const paidRes = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(
-      startOfTodayISO
-    )}&select=order_id,name,amount,paid_at`,
-    { headers: sbHeaders }
-  );
-  const paidRows = paidRes.data || [];
+  let paidRows = [];
+  try {
+    const paidRes = await axios.get(
+      `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(startOfTodayISO)}&select=order_id,name,amount,paid_at,hidden_from_today`,
+      { headers: sbHeaders }
+    );
+    paidRows = paidRes.data || [];
+    // exclude hidden_from_today ones
+    paidRows = paidRows.filter((r) => !r.hidden_from_today);
+  } catch (e) {
+    console.error("failed to fetch paidRows:", e.response?.data || e.message);
+  }
 
   let headerDate;
   try {
@@ -407,150 +312,108 @@ Shipment Mode: Normal`;
     listText += "No paid orders for today yet.";
   } else {
     paidRows.forEach((r, idx) => {
-      let dateStr = r.paid_at;
+      let dateStr = r.paid_at || "";
       try {
-        dateStr = DateTime.fromISO(r.paid_at)
-          .setZone(TIMEZONE)
-          .toFormat("dd/LL/yyyy");
+        dateStr = DateTime.fromISO(r.paid_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
       } catch (_) {}
-      listText += `${idx + 1}. ${r.name} (${r.order_id}) 📦 # ${dateStr}\n`;
+      listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) 📦 # ${dateStr}\n`;
     });
   }
 
-  await bot.sendMessage(chatId, listText);
+  await safeSend(chatId, listText);
 
-  // 6) Final confirmation
-  await bot.sendMessage(
-    chatId,
-    `✅ Order ${orderId} marked paid.\nWooCommerce → processing\nSupabase updated.\nCustomer thank-you will be sent automatically by AutoJS.`
-  );
+  // final confirmation
+  await safeSend(chatId, `✅ Order ${orderId} marked paid.\nWooCommerce → processing (attempted)\nSupabase updated.\nCustomer thank-you will be sent automatically by AutoJS.`);
 }
 
 /* ---------------------------------------------------
-   /paid <order_id>
+   /paid <order_id> (command)
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/paid\s+(.+)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const orderId = match[1]?.trim();
-
-    if (!orderId) {
-      return bot.sendMessage(chatId, "❌ Use: /paid <order_id>");
-    }
+    if (!orderId) return safeSend(chatId, "❌ Use: /paid <order_id>");
 
     try {
       await handleMarkPaid(chatId, orderId);
     } catch (err) {
-      console.error("/paid error:", err.response?.data || err.message);
-      return bot.sendMessage(
-        chatId,
-        "⚠️ Error processing /paid. Check logs."
-      );
+      console.error("/paid error:", err.response?.data || err.message || err);
+      await safeSend(chatId, "⚠️ Error processing /paid. Check logs.");
     }
   });
 }
 
 /* ---------------------------------------------------
-   /order <order_id>
-   - Show panel with actions:
-     [Mark Paid] [Resend QR] [Track] [Cancel Order]
+   /order <order_id> — show panel w/ inline buttons
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/order\s+(.+)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const orderId = match[1]?.trim();
-    if (!orderId) {
-      return bot.sendMessage(chatId, "Usage: /order <order_id>");
-    }
+    if (!orderId) return safeSend(chatId, "Usage: /order <order_id>");
 
     try {
       const resp = await axios.get(
-        `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-          orderId
-        )}&select=*`,
+        `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`,
         { headers: sbHeaders }
       );
-      if (!resp.data.length) {
-        return bot.sendMessage(chatId, `❌ Order ${orderId} not found.`);
-      }
-      const o = resp.data[0];
+      if (!resp.data.length) return safeSend(chatId, `❌ Order ${orderId} not found.`);
 
-      const text = `📦 Order #${o.order_id}\n\nName: ${o.name}\nAmount: ₹${o.amount}`;
+      const o = resp.data[0];
+      const text = `📦 Order #${o.order_id}\n\nName: ${o.name || ""}\nAmount: ₹${o.amount || 0}`;
 
       const keyboard = {
         inline_keyboard: [
           [
             { text: "✅ Mark Paid", callback_data: `order_paid:${o.order_id}` },
-            { text: "🔁 Resend QR", callback_data: `order_resend:${o.order_id}` },
+            { text: "🔁 Resend QR", callback_data: `order_resend:${o.order_id}` }
+          ],
+          [
             { text: "📦 Track", callback_data: `order_track:${o.order_id}` },
             { text: "❌ Cancel", callback_data: `order_cancel:${o.order_id}` }
           ]
         ]
       };
 
-      await bot.sendMessage(chatId, text, {
-        reply_markup: keyboard
-      });
+      await bot.sendMessage(chatId, text, { reply_markup: keyboard });
     } catch (e) {
       console.error("/order error:", e.response?.data || e.message);
-      await bot.sendMessage(chatId, "⚠️ Failed to load order.");
+      await safeSend(chatId, "⚠️ Failed to load order.");
     }
   });
 }
 
 /* ---------------------------------------------------
    /resend_qr <order_id>
-   - Set resend_qr_pending=true in Supabase
-   - AutoJS will pick it up and resend QR + text
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/resend_qr\s+(.+)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const id = match[1]?.trim();
-    if (!id) return bot.sendMessage(chatId, "Usage: /resend_qr <order_id>");
+    if (!id) return safeSend(chatId, "Usage: /resend_qr <order_id>");
 
     try {
-      await axios.patch(
-        `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(id)}`,
-        { resend_qr_pending: true },
-        { headers: sbHeaders }
-      );
-      await bot.sendMessage(
-        chatId,
-        `🔁 QR resend triggered for order ${id}.`
-      );
+      await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(id)}`, { resend_qr_pending: true }, { headers: sbHeaders });
+      await safeSend(chatId, `🔁 QR resend triggered for order ${id}.`);
     } catch (e) {
       console.error("/resend_qr error:", e.response?.data || e.message);
-      await bot.sendMessage(chatId, "⚠️ Failed to set resend flag.");
+      await safeSend(chatId, "⚠️ Failed to set resend flag.");
     }
   });
 }
 
 /* ---------------------------------------------------
    /track <order_id> <phone> <tracking_id>
-   - Mark tracking_sent=true, status=completed in Supabase
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/track\s+(\S+)\s+(\S+)\s+(\S+)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const [_, orderId, phone, tracking] = match;
-
     try {
-      await axios.patch(
-        `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-          orderId
-        )}`,
-        {
-          tracking_sent: true,
-          status: "completed"
-        },
-        { headers: sbHeaders }
-      );
+      await patch(orderId, { tracking_sent: true, status: "completed" });
 
-      await bot.sendMessage(
-        chatId,
-        `📦 Tracking set:\nOrder: ${orderId}\nPhone: ${phone}\nTracking ID: ${tracking}`
-      );
+      await safeSend(chatId, `📦 Tracking set:\nOrder: ${orderId}\nPhone: ${phone}\nTracking ID: ${tracking}`);
 
       const infoText =
 `📦 Track Your India Post Order
@@ -564,166 +427,93 @@ Please copy your tracking ID and paste it on the official tracking website below
 🔗 Track Your Order Here: https://myspeedpost.com/
 
 On this website, you can also get live updates about your order directly on WhatsApp so that you never miss your delivery date.
-Just click on the “Get Live Updates on WhatsApp” button and follow the simple steps to start receiving instant updates about your shipment status.
-
 Thank you for shopping with us! Visionsjersey.`;
 
-      await bot.sendMessage(chatId, infoText);
+      await safeSend(chatId, infoText);
     } catch (e) {
       console.error("/track error:", e.response?.data || e.message);
-      await bot.sendMessage(chatId, "⚠️ Failed to update tracking.");
+      await safeSend(chatId, "⚠️ Failed to update tracking.");
     }
   });
 }
 
 /* ---------------------------------------------------
    /export_today
-   - List today's orders (all statuses)
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/export_today/i, async (msg) => {
     const chatId = msg.chat.id;
-
     try {
-      const start = DateTime.now()
-        .setZone(TIMEZONE)
-        .startOf("day")
-        .toUTC()
-        .toISO();
-
-      const resp = await axios.get(
-        `${SUPABASE_URL}/rest/v1/orders?created_at=gte.${encodeURIComponent(
-          start
-        )}&select=order_id,name,phone,amount,status`,
-        { headers: sbHeaders }
-      );
-
+      const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
+      const resp = await axios.get(`${SUPABASE_URL}/rest/v1/orders?created_at=gte.${encodeURIComponent(start)}&select=order_id,name,phone,amount,status`, { headers: sbHeaders });
       const rows = resp.data || [];
-      if (!rows.length) return bot.sendMessage(chatId, "📭 No orders today.");
-
+      if (!rows.length) return safeSend(chatId, "📭 No orders today.");
       let txt = "📄 Today Orders:\n\n";
       rows.forEach((o) => {
-        txt += `• ${o.order_id} | ${o.name} | ₹${o.amount} | ${o.status}\n`;
+        txt += `• ${o.order_id} | ${o.name || ""} | ₹${o.amount || 0} | ${o.status || ""}\n`;
       });
-
-      await bot.sendMessage(chatId, txt);
+      await safeSend(chatId, txt);
     } catch (e) {
       console.error("/export_today error:", e.response?.data || e.message);
-      await bot.sendMessage(chatId, "⚠️ Failed to export today's orders.");
+      await safeSend(chatId, "⚠️ Failed to export today's orders.");
     }
   });
 }
 
 /* ---------------------------------------------------
    /today
-   - Show today's paid orders
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/today/i, async (msg) => {
     const chatId = msg.chat.id;
+    let todayKey;
+    try {
+      todayKey = DateTime.now().setZone(TIMEZONE).toISODate();
+    } catch (_) {
+      todayKey = new Date().toISOString().slice(0, 10);
+    }
+    if (clearedTodayDate === todayKey) {
+      return safeSend(chatId, "✅ Today's orders were cleared from /today view.");
+    }
 
     try {
-      const start = DateTime.now()
-        .setZone(TIMEZONE)
-        .startOf("day")
-        .toUTC()
-        .toISO();
-
-      const r = await axios.get(
-        `${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(
-          start
-        )}&status=eq.paid&select=order_id,name,amount`,
-        { headers: sbHeaders }
-      );
-
-      const rows = r.data || [];
-      if (!rows.length)
-        return bot.sendMessage(chatId, "📭 No paid orders yet today.");
-
+      const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
+      const r = await axios.get(`${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(start)}&status=eq.paid&select=order_id,name,amount,hidden_from_today`, { headers: sbHeaders });
+      const rows = (r.data || []).filter((x) => !x.hidden_from_today);
+      if (!rows.length) return safeSend(chatId, "📭 No paid orders yet today.");
       let text = "📅 Today’s Paid Orders\n\n";
-      rows.forEach((o) => {
-        text += `• ${o.order_id} | ${o.name} | ₹${o.amount}\n`;
-      });
-
-      await bot.sendMessage(chatId, text);
+      rows.forEach((o) => { text += `• ${o.order_id} | ${o.name || ""} | ₹${o.amount || 0}\n`; });
+      await safeSend(chatId, text);
     } catch (e) {
       console.error("/today error:", e.response?.data || e.message);
-      await bot.sendMessage(
-        chatId,
-        "⚠️ Failed to fetch today's paid orders."
-      );
+      await safeSend(chatId, "⚠️ Failed to fetch today's paid orders.");
     }
   });
 }
 
 /* ---------------------------------------------------
    /clear_today
-   - Show today's paid orders with buttons to cancel them
-   - Cancels in Woo + Supabase using cancelOrderEverywhere
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/clear_today/i, async (msg) => {
-    const chatId = msg.chat.id;
-
+    let todayKey;
     try {
-      const start = DateTime.now()
-        .setZone(TIMEZONE)
-        .startOf("day")
-        .toUTC()
-        .toISO();
-
-      const r = await axios.get(
-        `${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(
-          start
-        )}&status=eq.paid&select=order_id,name,amount`,
-        { headers: sbHeaders }
-      );
-
-      const rows = r.data || [];
-      if (!rows.length) {
-        return bot.sendMessage(chatId, "📭 No paid orders to clear today.");
-      }
-
-      let text = "📅 Today’s Paid Orders (tap to cancel):\n\n";
-      const buttons = [];
-
-      rows.forEach((o, idx) => {
-        text += `${idx + 1}. ${o.name} (${o.order_id}) • ₹${o.amount}\n`;
-        buttons.push([
-          {
-            text: `❌ Cancel ${o.order_id}`,
-            callback_data: `clear_cancel:${o.order_id}`
-          }
-        ]);
-      });
-
-      // optional: cancel all
-      buttons.push([
-        {
-          text: "❌ Cancel ALL paid today",
-          callback_data: "clear_cancel_all:today"
-        }
-      ]);
-
-      await bot.sendMessage(chatId, text, {
-        reply_markup: { inline_keyboard: buttons }
-      });
-    } catch (e) {
-      console.error("/clear_today error:", e.response?.data || e.message);
-      await bot.sendMessage(chatId, "⚠️ Failed to load today's paid orders.");
+      todayKey = DateTime.now().setZone(TIMEZONE).toISODate();
+    } catch (_) {
+      todayKey = new Date().toISOString().slice(0, 10);
     }
+    clearedTodayDate = todayKey;
+    await safeSend(msg.chat.id, "✅ Cleared today's paid orders from /today view (DB not changed).");
   });
 }
 
 /* ---------------------------------------------------
    /paidorders
-   - Show inline buttons for 3 previous days, today, 3 next days
-   - Clicking a date shows that day's paid orders
+   - shows date buttons D-3..D+3
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/paidorders/i, async (msg) => {
     const chatId = msg.chat.id;
-
     let base;
     try {
       base = DateTime.now().setZone(TIMEZONE).startOf("day");
@@ -732,222 +522,163 @@ if (bot) {
     }
 
     const buttons = [];
-
-    // row: D-3, D-2, D-1
     const row1 = [];
     for (let i = -3; i <= -1; i++) {
       const d = base.plus({ days: i });
-      const label = d.toFormat("dd/MM");
-      const key = d.toISODate();
-      row1.push({
-        text: label,
-        callback_data: `paidorders:${key}`
-      });
+      row1.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
     }
     buttons.push(row1);
 
-    // row: Today
-    const todayRow = [
-      {
-        text: "Today",
-        callback_data: `paidorders:${base.toISODate()}`
-      }
-    ];
-    buttons.push(todayRow);
+    buttons.push([{ text: "Today", callback_data: `paidorders:${base.toISODate()}` }]);
 
-    // row: D+1, D+2, D+3
     const row3 = [];
     for (let i = 1; i <= 3; i++) {
       const d = base.plus({ days: i });
-      const label = d.toFormat("dd/MM");
-      const key = d.toISODate();
-      row3.push({
-        text: label,
-        callback_data: `paidorders:${key}`
-      });
+      row3.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
     }
     buttons.push(row3);
 
-    await bot.sendMessage(chatId, "📅 Choose a date to view paid orders:", {
-      reply_markup: { inline_keyboard: buttons }
-    });
+    await bot.sendMessage(chatId, "📅 Choose a date to view paid orders:", { reply_markup: { inline_keyboard: buttons } });
   });
 }
 
 /* ---------------------------------------------------
-   /restore <order_id>
-   - Restore cancelled order using previous_status + previous_wc_status
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/restore\s+(.+)/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const orderId = match[1]?.trim();
-    if (!orderId) {
-      return bot.sendMessage(chatId, "Usage: /restore <order_id>");
-    }
-
-    try {
-      await restoreOrderEverywhere(orderId);
-      await bot.sendMessage(
-        chatId,
-        `♻ Order ${orderId} restored in Supabase + WooCommerce.`
-      );
-    } catch (e) {
-      console.error("/restore error:", e.response?.data || e.message);
-      await bot.sendMessage(
-        chatId,
-        "⚠️ Failed to restore order. Maybe it is not cancelled or has no previous_status."
-      );
-    }
-  });
-}
-
-/* ---------------------------------------------------
-   CRON / REMINDERS
---------------------------------------------------- */
-app.get("/cron-check", async (req, res) => {
-  try {
-    const orders = await axios.get(
-      `${SUPABASE_URL}/rest/v1/orders?status=eq.pending_payment&select=*`,
-      { headers: sbHeaders }
-    );
-
-    for (const o of orders.data) {
-      const h = hoursSince(o.created_at);
-
-      if (!o.reminder_24_sent && h >= 24)
-        await patch(o.order_id, {
-          reminder_24_sent: true,
-          next_message: "reminder_48h"
-        });
-
-      if (!o.reminder_48_sent && h >= 48)
-        await patch(o.order_id, {
-          reminder_48_sent: true,
-          discounted_amount: o.amount - 30,
-          next_message: "reminder_72h"
-        });
-
-      if (!o.reminder_72_sent && h >= 72)
-        await patch(o.order_id, {
-          reminder_72_sent: true,
-          status: "cancelled"
-        });
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.send("ERR");
-  }
-});
-
-/* ---------------------------------------------------
-   Night Summary (simple)
---------------------------------------------------- */
-app.get("/night-summary", async (req, res) => {
-  if (!bot || !SUPPLIER_CHAT_ID) return res.send("BOT DISABLED");
-
-  const start = DateTime.now()
-    .setZone(TIMEZONE)
-    .startOf("day")
-    .toUTC()
-    .toISO();
-
-  const paid = await axios.get(
-    `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(
-      start
-    )}&select=*`,
-    { headers: sbHeaders }
-  );
-
-  let report = `📊 Daily Summary\nPaid Orders: ${paid.data.length}`;
-
-  bot.sendMessage(SUPPLIER_CHAT_ID, report);
-  res.send("OK");
-});
-
-/* ---------------------------------------------------
-   CALLBACK HANDLER (for inline buttons)
+   CALLBACK HANDLER (inline buttons)
+   - order_paid, order_resend, order_track, order_cancel
+   - order_cancel opens submenu with options:
+       order_cancel_action:<id>:only_list
+       order_cancel_action:<id>:full
+       order_cancel_action:<id>:restore
 --------------------------------------------------- */
 if (bot) {
   bot.on("callback_query", async (query) => {
     const data = query.data || "";
     const chatId = query.message.chat.id;
-
     try {
-      // ----- /order buttons -----
+      // order buttons
       if (data.startsWith("order_paid:")) {
         const orderId = data.split(":")[1];
         await handleMarkPaid(chatId, orderId);
       } else if (data.startsWith("order_resend:")) {
         const orderId = data.split(":")[1];
-        await axios.patch(
-          `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(
-            orderId
-          )}`,
-          { resend_qr_pending: true },
-          { headers: sbHeaders }
-        );
-        await bot.sendMessage(
-          chatId,
-          `🔁 QR resend triggered for order ${orderId}.`
-        );
+        await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, { resend_qr_pending: true }, { headers: sbHeaders });
+        await safeSend(chatId, `🔁 QR resend triggered for order ${orderId}.`);
       } else if (data.startsWith("order_track:")) {
         const orderId = data.split(":")[1];
-        await bot.sendMessage(
-          chatId,
-          `To set tracking, use:\n/track ${orderId} <phone> <tracking_id>`
-        );
+        await safeSend(chatId, `To set tracking, use:\n/track ${orderId} <phone> <tracking_id>`);
       } else if (data.startsWith("order_cancel:")) {
+        // show cancel submenu
         const orderId = data.split(":")[1];
-
-        await cancelOrderEverywhere(orderId);
-
-        await bot.sendMessage(
-          chatId,
-          `❌ Order ${orderId} cancelled in WooCommerce + Supabase.`
-        );
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "🗂 Cancel only in today list", callback_data: `order_cancel_action:${orderId}:only_list` },
+              { text: "❌ Cancel in Woo+Supabase", callback_data: `order_cancel_action:${orderId}:full` }
+            ],
+            [
+              { text: "♻️ Restore (if cancelled)", callback_data: `order_cancel_action:${orderId}:restore` }
+            ]
+          ]
+        };
+        await bot.sendMessage(chatId, `Choose cancel action for order ${orderId}:`, { reply_markup: keyboard });
       }
 
-      // ----- /clear_today cancel buttons -----
-      else if (data.startsWith("clear_cancel:")) {
-        const orderId = data.split(":")[1];
-        await cancelOrderEverywhere(orderId);
-        await bot.sendMessage(
-          chatId,
-          `❌ Order ${orderId} cancelled (Woo + Supabase).`
-        );
-      } else if (data.startsWith("clear_cancel_all:")) {
-        // cancel all today's paid orders
-        const start = DateTime.now()
-          .setZone(TIMEZONE)
-          .startOf("day")
-          .toUTC()
-          .toISO();
+      // cancel submenu actions
+      else if (data.startsWith("order_cancel_action:")) {
+        const parts = data.split(":");
+        const orderId = parts[1];
+        const action = parts[2];
 
-        const r = await axios.get(
-          `${SUPABASE_URL}/rest/v1/orders?paid_at=gte.${encodeURIComponent(
-            start
-          )}&status=eq.paid&select=order_id`,
-          { headers: sbHeaders }
-        );
+        if (action === "only_list") {
+          // set hidden_from_today true (does not modify DB status)
+          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, { hidden_from_today: true }, { headers: sbHeaders });
+          await safeSend(chatId, `✅ Order ${orderId} hidden from today's list.`);
+        } else if (action === "full") {
+          // FULL cancel: save previous fields, set cancelled, call Woo
+          const fetchRes = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`, { headers: sbHeaders });
+          const rows = fetchRes.data || [];
+          if (!rows.length) return safeSend(chatId, `Order ${orderId} not found.`);
+          const o = rows[0];
 
-        const rows = r.data || [];
-        for (const o of rows) {
-          await cancelOrderEverywhere(o.order_id);
+          // prepare previous_* backup
+          const backup = {
+            previous_status: o.status || null,
+            previous_paid_at: o.paid_at || null,
+            previous_amount: o.amount || null,
+            previous_next_message: o.next_message || null,
+            previous_reminder_24_sent: o.reminder_24_sent || false,
+            previous_reminder_48_sent: o.reminder_48_sent || false,
+            previous_reminder_72_sent: o.reminder_72_sent || false
+          };
+
+          // attempt Woo cancellation
+          if (WC_USER && WC_PASS) {
+            try {
+              await axios.put(`https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`, { status: "cancelled" }, { auth: { username: WC_USER, password: WC_PASS } });
+            } catch (e) {
+              console.error("Woo cancel failed:", e.response?.data || e.message);
+            }
+          }
+
+          // patch supabase: set cancelled + backup previous_*
+          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, Object.assign({
+            status: "cancelled",
+            next_message: null,
+            reminder_24_sent: true,
+            reminder_48_sent: true,
+            reminder_72_sent: true,
+            hidden_from_today: true
+          }, backup), { headers: sbHeaders });
+
+          await safeSend(chatId, `❌ Order ${orderId} cancelled in WooCommerce (attempted) and Supabase. Restore is available.`);
+        } else if (action === "restore") {
+          // restore if previous_status exists
+          const fetchRes = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`, { headers: sbHeaders });
+          const rows = fetchRes.data || [];
+          if (!rows.length) return safeSend(chatId, `Order ${orderId} not found.`);
+          const o = rows[0];
+          if (!o.previous_status) {
+            return safeSend(chatId, `No previous state found for order ${orderId}. Cannot restore.`);
+          }
+
+          // attempt to restore Woo to previous_status if possible
+          if (WC_USER && WC_PASS) {
+            try {
+              await axios.put(`https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`, { status: o.previous_status }, { auth: { username: WC_USER, password: WC_PASS } });
+            } catch (e) {
+              console.error("Woo restore failed:", e.response?.data || e.message);
+            }
+          }
+
+          // patch Supabase to restore previous_*
+          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, {
+            status: o.previous_status,
+            paid_at: o.previous_paid_at,
+            amount: o.previous_amount,
+            next_message: o.previous_next_message,
+            reminder_24_sent: o.previous_reminder_24_sent,
+            reminder_48_sent: o.previous_reminder_48_sent,
+            reminder_72_sent: o.previous_reminder_72_sent,
+            hidden_from_today: false,
+            // clear backups
+            previous_status: null,
+            previous_paid_at: null,
+            previous_amount: null,
+            previous_next_message: null,
+            previous_reminder_24_sent: null,
+            previous_reminder_48_sent: null,
+            previous_reminder_72_sent: null
+          }, { headers: sbHeaders });
+
+          await safeSend(chatId, `♻️ Order ${orderId} restored to previous status.`);
+        } else {
+          await safeSend(chatId, "Unknown cancel action.");
         }
-
-        await bot.sendMessage(
-          chatId,
-          `❌ Cancelled ${rows.length} paid orders for today (Woo + Supabase).`
-        );
       }
 
-      // ----- /paidorders date buttons -----
+      // paidorders date buttons
       else if (data.startsWith("paidorders:")) {
         const dateKey = data.split(":")[1]; // YYYY-MM-DD
-
         let start, end;
         try {
           const d = DateTime.fromISO(dateKey, { zone: TIMEZONE });
@@ -959,44 +690,70 @@ if (bot) {
           end = new Date(d.getTime() + 24 * 3600000).toISOString();
         }
 
-        const r = await axios.get(
-          `${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(
-            start
-          )}&paid_at=lt.${encodeURIComponent(
-            end
-          )}&select=order_id,name,amount,paid_at`,
-          { headers: sbHeaders }
-        );
-
-        const rows = r.data || [];
+        const r = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&paid_at=lt.${encodeURIComponent(end)}&select=order_id,name,amount,paid_at,hidden_from_today`, { headers: sbHeaders });
+        let rows = r.data || [];
+        rows = rows.filter((x) => !x.hidden_from_today);
 
         let header = `${dateKey} paid orders 🌼\n\n`;
-        if (!rows.length) {
-          header += "No paid orders on this date.";
-        } else {
+        if (!rows.length) header += "No paid orders on this date.";
+        else {
           rows.forEach((o, idx) => {
             let dateStr = o.paid_at;
             try {
-              dateStr = DateTime.fromISO(o.paid_at)
-                .setZone(TIMEZONE)
-                .toFormat("dd/LL/yyyy");
+              dateStr = DateTime.fromISO(o.paid_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
             } catch (_) {}
-            header += `${idx + 1}. ${o.name} (${o.order_id}) 📦 # ${dateStr}\n`;
+            header += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦 # ${dateStr}\n`;
           });
         }
-
-        await bot.sendMessage(chatId, header);
+        await safeSend(chatId, header);
+      } else {
+        // unknown callback - ack
+        await bot.answerCallbackQuery(query.id, { text: "Action received" });
       }
     } catch (e) {
-      console.error("callback_query error:", e.response?.data || e.message);
-      await bot.sendMessage(chatId, "⚠️ Error handling button action.");
+      console.error("callback_query error:", e.response?.data || e.message || e);
+      try { await safeSend(chatId, "⚠️ Error handling button action."); } catch (_) {}
     } finally {
-      try {
-        await bot.answerCallbackQuery(query.id);
-      } catch (_) {}
+      try { await bot.answerCallbackQuery(query.id); } catch (_) {}
     }
   });
 }
+
+/* ---------------------------------------------------
+   CRON / REMINDERS
+--------------------------------------------------- */
+app.get("/cron-check", async (req, res) => {
+  try {
+    const orders = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.pending_payment&select=*`, { headers: sbHeaders });
+    for (const o of orders.data) {
+      const h = hoursSince(o.created_at);
+      if (!o.reminder_24_sent && h >= 24)
+        await patch(o.order_id, { reminder_24_sent: true, next_message: "reminder_48h" });
+
+      if (!o.reminder_48_sent && h >= 48)
+        await patch(o.order_id, { reminder_48_sent: true, discounted_amount: o.amount - 30, next_message: "reminder_72h" });
+
+      if (!o.reminder_72_sent && h >= 72)
+        await patch(o.order_id, { reminder_72_sent: true, status: "cancelled" });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("CRON-CHECK error:", err.response?.data || err.message || err);
+    res.status(500).send("ERROR");
+  }
+});
+
+/* ---------------------------------------------------
+   Night Summary
+--------------------------------------------------- */
+app.get("/night-summary", async (req, res) => {
+  if (!bot || !SUPPLIER_CHAT_ID) return res.send("BOT DISABLED");
+  const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
+  const paid = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&select=*`, { headers: sbHeaders });
+  let report = `📊 Daily Summary\nPaid Orders: ${paid.data.length}`;
+  await safeSend(SUPPLIER_CHAT_ID, report);
+  res.send("OK");
+});
 
 // ---------------- LISTEN ----------------
 const PORT = process.env.PORT || 10000;
