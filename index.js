@@ -1,5 +1,5 @@
-// index.js — VisionsJersey automation (Final: Option B - one row per item)
-// 2025-12 - Finalized: inserts order_items at webhook + saves paid_order_items per item
+// index.js — VisionsJersey automation (Final: cleaned & fixed)
+// 2025-12 - Consolidated and fixed version (includes order_items + paid_order_items)
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -73,63 +73,82 @@ async function safeSend(chatId, text) {
   }
 }
 
-// Extract attributes helper (search meta[] for pa_sizes, pa_technique)
+// Extract size & technique robustly from line item meta
 function extractAttrsFromLineItem(item) {
-  // item.meta is an array of { key, value, label }
-  const meta = item.meta || [];
+  const meta = item.meta || item.meta_data || item.meta_data || [];
   let size = "";
   let technique = "";
+
   for (const m of meta) {
     if (!m) continue;
+
     const key = (m.key || "").toString().toLowerCase();
     const label = (m.label || "").toString().toLowerCase();
-    const val = m.value || m.value_html || m.display_value || m.text || m;
-    if (key === "pa_sizes" || label.includes("size") || key === "size") {
-      size = val || size;
+    const value = (m.value || m.display_value || m.text || "").toString().trim();
+
+    // SIZE checks
+    if (
+      key.includes("size") ||
+      key.includes("pa_sizes") ||
+      key.includes("attribute_pa_size") ||
+      label.includes("size")
+    ) {
+      size = value || size;
     }
-    if (key === "pa_technique" || label.includes("technique") || key === "technique") {
-      technique = val || technique;
+
+    // TECHNIQUE checks
+    if (
+      key.includes("technique") ||
+      key.includes("pa_technique") ||
+      key.includes("attribute_pa_technique") ||
+      label.includes("technique")
+    ) {
+      technique = value || technique;
     }
   }
-  return { size: String(size || "").trim(), technique: String(technique || "").trim() };
+
+  return { size, technique };
 }
 
 // ---------------- HEALTH ----------------
 app.get("/", (req, res) => res.send("🔥 WC → Supabase Automation Live"));
 
 // ---------------- WEBHOOK INSERT (Woo → Supabase) ----------------
-/*
-  Expected Woo payload: { order: {...} }
-  We insert:
-   - one row into orders (as before)
-   - multiple rows into order_items (one per line_item)
-*/
 app.post("/woocommerce-webhook", async (req, res) => {
   try {
-    const order = req.body.order || req.body; // accommodate different webhook shapes
+    const order = req.body.order;
     if (!order) return res.send("NO ORDER");
 
-    let qty = 1;
     let size = "";
+    let qty = 1;
+
     try {
+      const meta = order.line_items && order.line_items[0] && (order.line_items[0].meta || order.line_items[0].meta_data);
+      if (meta) {
+        const s = (meta || []).find(
+          (m) =>
+            (m.key === "pa_sizes" || (m.label && m.label.toLowerCase().includes("size")))
+        );
+        if (s) size = s.value || s.display_value || s.text || "";
+      }
       qty =
         order.total_line_items_quantity ||
-        order.line_items?.[0]?.quantity ||
+        (order.line_items && order.line_items[0] && order.line_items[0].quantity) ||
         1;
     } catch (_) {}
 
     const mapped = {
       order_id: String(order.id),
-      name: order.billing?.first_name || order.billing_address?.first_name || "",
-      phone: order.billing?.phone || order.billing_address?.phone || "",
-      email: order.billing?.email || order.billing_address?.email || "",
+      name: (order.billing_address && order.billing_address.first_name) || "",
+      phone: (order.billing_address && order.billing_address.phone) || "",
+      email: (order.billing_address && order.billing_address.email) || "",
       amount: Number(order.total) || 0,
-      product: order.line_items?.[0]?.name || "",
-      sku: order.line_items?.[0]?.sku || "",
-      size: "", // placeholder; details in order_items
-      address: (order.billing?.address_1 || order.billing_address?.address_1 || ""),
-      state: (order.billing?.state || order.billing_address?.state || ""),
-      pincode: (order.billing?.postcode || order.billing_address?.postcode || ""),
+      product: (order.line_items && order.line_items[0] && order.line_items[0].name) || "",
+      sku: (order.line_items && order.line_items[0] && order.line_items[0].sku) || "",
+      size,
+      address: (order.billing_address && order.billing_address.address_1) || "",
+      state: (order.billing_address && order.billing_address.state) || "",
+      pincode: (order.billing_address && order.billing_address.postcode) || "",
       quantity: qty,
 
       status: "pending_payment",
@@ -148,7 +167,7 @@ app.post("/woocommerce-webhook", async (req, res) => {
       tracking_sent: false,
       hidden_from_today: false,
 
-      // backups for cancel/restore
+      // previous_* fields are null by default and filled on full cancel
       previous_status: null,
       previous_paid_at: null,
       previous_amount: null,
@@ -158,39 +177,44 @@ app.post("/woocommerce-webhook", async (req, res) => {
       previous_reminder_72_sent: null
     };
 
-    // 1) Insert order row
-    const orderInsert = await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
+    // insert main order row
+    const insertRes = await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
 
-    // 2) Insert one order_items row per line_item
-    const items = order.line_items || [];
-    const orderItemsPayload = [];
-    for (const li of items) {
-      const { size: liSize, technique: liTechnique } = extractAttrsFromLineItem(li);
-      const quantity = li.quantity || 1;
-      const unit_price = Number(li.price || li.subtotal || 0); // price per unit where available
-      const itemRow = {
-        order_id: String(order.id),
-        sku: li.sku || "",
-        product_name: li.name || "",
-        quantity: quantity,
-        unit_price: unit_price,
-        line_total: Number(li.total || li.subtotal || (unit_price * quantity) || 0),
-        size: liSize,
-        technique: liTechnique,
-        created_at: nowISO()
-      };
-      orderItemsPayload.push(itemRow);
-    }
+    // now insert order_items (if any)
+    try {
+      const items = order.line_items || [];
+      const orderItemsPayload = [];
 
-    if (orderItemsPayload.length) {
-      // Supabase REST: insert array of rows in one call
-      await axios.post(`${SUPABASE_URL}/rest/v1/order_items`, orderItemsPayload, { headers: sbHeaders });
+      for (const li of items) {
+        const attrs = extractAttrsFromLineItem(li);
+
+        const itemRow = {
+          order_id: String(order.id),
+          sku: li.sku || "",
+          product_name: li.name || "",
+          quantity: li.quantity || 1,
+          unit_price: Number(li.price || li.subtotal || 0),
+          line_total: Number(li.total || li.subtotal || 0),
+          size: attrs.size || "",
+          technique: attrs.technique || "",
+          created_at: nowISO()
+        };
+
+        orderItemsPayload.push(itemRow);
+      }
+
+      if (orderItemsPayload.length) {
+        // Supabase allows inserting array of rows
+        await axios.post(`${SUPABASE_URL}/rest/v1/order_items`, orderItemsPayload, { headers: sbHeaders });
+      }
+    } catch (e) {
+      console.error("order_items insert failed:", e.response?.data || e.message || e);
+      // don't fail the webhook — main order was saved
     }
 
     return res.send("OK");
   } catch (err) {
-    console.error("WEBHOOK ERROR:", err.response?.data || err.message || err);
-    // reply 200 to avoid infinite webhook retries, but log
+    console.error("WEBHOOK ERROR:", (err.response && err.response.data) || err.message || err);
     return res.status(200).send("ERR");
   }
 });
@@ -212,8 +236,8 @@ if (bot) {
 - Mark order as paid
 - WooCommerce → processing
 - Supabase → status paid + thank-you pending
-- Sends supplier format (lists ALL items)
-- Saves each item into paid_order_items (one row per item) and sends today's list
+- Sends supplier format
+- Saves paid item to paid_order_items (today) and sends today's paid list
 
 /resend_qr <order_id>
 - Trigger AutoJS to resend QR + pending message
@@ -225,7 +249,7 @@ if (bot) {
 - List today's orders (all statuses)
 
 /today
-- Show today's PAID orders (from paid_order_items table)
+- Show today's PAID orders
 
 /clear_today
 - Hide today's paid orders from /today (view only)
@@ -237,12 +261,11 @@ Notes:
 - Cancel button opens a submenu: Cancel only in list, Cancel in Woo+Supabase, Restore (if available).`;
     await safeSend(chatId, text);
   });
-}
+});
 
 /* ---------------------------------------------------
    Core: mark paid logic (shared)
-   - marks order paid
-   - inserts each order_items row into paid_order_items (day = today)
+   (Also: insert into paid_order_items table — day = today)
 --------------------------------------------------- */
 async function handleMarkPaid(chatId, orderId) {
   console.log("handleMarkPaid:", orderId);
@@ -296,19 +319,7 @@ async function handleMarkPaid(chatId, orderId) {
     // continue
   }
 
-  // 4) Fetch order_items for this order
-  let orderItems = [];
-  try {
-    const r = await axios.get(
-      `${SUPABASE_URL}/rest/v1/order_items?order_id=eq.${encodeURIComponent(orderId)}&select=*`,
-      { headers: sbHeaders }
-    );
-    orderItems = r.data || [];
-  } catch (e) {
-    console.error("Failed to fetch order_items:", e.response?.data || e.message);
-  }
-
-  // 5) Insert each item into paid_order_items with day = today
+  // 4) Insert into paid_order_items (day = today's date in TIMEZONE)
   try {
     let dayKey;
     try {
@@ -317,38 +328,21 @@ async function handleMarkPaid(chatId, orderId) {
       dayKey = new Date().toISOString().slice(0, 10);
     }
 
-    const paidItemsPayload = orderItems.map((it) => ({
+    const paidItem = {
       day: dayKey,
-      order_id: String(order.order_id || orderId),
-      sku: it.sku || "",
-      product_name: it.product_name || "",
-      quantity: it.quantity || 1,
-      unit_price: it.unit_price || 0,
-      line_total: it.line_total || 0,
-      size: it.size || "",
-      technique: it.technique || "",
+      order_id: order.order_id || String(orderId),
       name: order.name || "",
+      amount: order.amount || 0,
       created_at: nowISO()
-    }));
+    };
 
-    if (paidItemsPayload.length) {
-      await axios.post(`${SUPABASE_URL}/rest/v1/paid_order_items`, paidItemsPayload, { headers: sbHeaders });
-    }
+    // insert row
+    await axios.post(`${SUPABASE_URL}/rest/v1/paid_order_items`, paidItem, { headers: sbHeaders });
   } catch (e) {
     console.error("Insert paid_order_items failed:", e.response?.data || e.message || e);
   }
 
-  // 6) Send supplier format (lists all items)
-  let itemsText = "";
-  if (orderItems.length) {
-    orderItems.forEach((it, i) => {
-      itemsText += `${i + 1}. ${it.product_name || "-"} — Size: ${it.size || "-"} — Technique: ${it.technique || "-"} — Qty: ${it.quantity || 1}\n`;
-    });
-  } else {
-    // fallback: if no items table found, show order.product
-    itemsText = `• ${order.product || "Unknown product"} (qty ${order.quantity || 1})\n`;
-  }
-
+  // 5) Send supplier format (plain text)
   const supplierText =
 `📦 NEW PAID ORDER
 
@@ -362,13 +356,15 @@ Address: ${order.address || ""}
 State: ${order.state || ""}
 Pincode: ${order.pincode || ""}
 Phone: ${order.phone || ""}
-Order ID: ${order.order_id || orderId}
+SKU ID: ${order.sku || ""}
 
-Items:
-${itemsText}
+Product: ${order.product || ""}
+Size: ${order.size || ""}
+Quantity: ${order.quantity || ""}
 
 Shipment Mode: Normal`;
 
+  // send to supplier + admin chat
   try {
     if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
     await safeSend(chatId, supplierText);
@@ -376,7 +372,7 @@ Shipment Mode: Normal`;
     console.error("failed to send supplier message:", e.response?.data || e.message);
   }
 
-  // 7) Build today's paid list from paid_order_items (primary source)
+  // 6) Build today's paid list from paid_order_items (primary source)
   let listText = "";
   try {
     let dayKey;
@@ -387,7 +383,7 @@ Shipment Mode: Normal`;
     }
 
     const paidItemsRes = await axios.get(
-      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=order_id,name,product_name,quantity,amount:line_total,created_at`,
+      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=order_id,name,amount,created_at`,
       { headers: sbHeaders }
     );
     const saved = paidItemsRes.data || [];
@@ -403,189 +399,8 @@ Shipment Mode: Normal`;
     if (!saved.length) {
       listText += "No paid orders for today yet.";
     } else {
-      // group by order_id to show compact list (one line per order)
-      const grouped = {};
-      saved.forEach((r) => {
-        grouped[r.order_id] = grouped[r.order_id] || { name: r.name || "-", items: [], total: 0, created_at: r.created_at };
-        grouped[r.order_id].items.push(`${r.product_name || "-"} x${r.quantity || 1}`);
-        grouped[r.order_id].total += Number(r.amount || 0);
-      });
-      let idx = 1;
-      for (const oid of Object.keys(grouped)) {
-        const g = grouped[oid];
-        listText += `${idx}. ${g.name} (${oid}) — ₹${g.total.toFixed(0)} — ${g.items.join(", ")}\n`;
-        idx++;
-      }
-    }
-  } catch (e) {
-    console.error("Failed to build today's list from paid_order_items:", e.response?.data || e.message);
-    listText = "Today's paid list couldn't be loaded from DB.";
-  }
-
-  await safeSend(chatId, listText);
-
-  // final confirmation
-  await safeSend(chatId, `✅ Order ${orderId} marked paid.\nWooCommerce → processing (attempted)\nSupabase updated.\nCustomer thank-you will be sent automatically by AutoJS.`);
-}
-
-/* ---------------------------------------------------
-   /paid <order_id> (command)
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/paid\s+(.+)/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const orderId = match[1]?.trim();
-    if (!orderId) return safeSend(chatId, "❌ Use: /paid <order_id>");
-
-    try {
-      await handleMarkPaid(chatId, orderId);
-    } catch (err) {
-      console.error("/paid error:", err.response?.data || err.message || err);
-      await safeSend(chatId, "⚠️ Error processing /paid. Check logs.");
-    }
-  });
-}
-
-/* ---------------------------------------------------
-   /order <order_id> — show panel w/ inline buttons
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/order\s+(.+)/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const orderId = match[1]?.trim();
-    if (!orderId) return safeSend(chatId, "Usage: /order <order_id>");
-
-    try {
-      const resp = await axios.get(
-        `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`,
-        { headers: sbHeaders }
-      );
-      if (!resp.data.length) return safeSend(chatId, `❌ Order ${orderId} not found.`);
-
-      const o = resp.data[0];
-      const text = `📦 Order #${o.order_id}\n\nName: ${o.name || ""}\nAmount: ₹${o.amount || 0}`;
-
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: "✅ Mark Paid", callback_data: `order_paid:${o.order_id}` },
-            { text: "🔁 Resend QR", callback_data: `order_resend:${o.order_id}` }
-          ],
-          [
-            { text: "📦 Track", callback_data: `order_track:${o.order_id}` },
-            { text: "❌ Cancel", callback_data: `order_cancel:${o.order_id}` }
-          ]
-        ]
-      };
-
-      await bot.sendMessage(chatId, text, { reply_markup: keyboard });
-    } catch (e) {
-      console.error("/order error:", e.response?.data || e.message);
-      await safeSend(chatId, "⚠️ Failed to load order.");
-    }
-  });
-}
-
-/* ---------------------------------------------------
-   /resend_qr <order_id>
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/resend_qr\s+(.+)/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const id = match[1]?.trim();
-    if (!id) return safeSend(chatId, "Usage: /resend_qr <order_id>");
-
-    try {
-      await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(id)}`, { resend_qr_pending: true }, { headers: sbHeaders });
-      await safeSend(chatId, `🔁 QR resend triggered for order ${id}.`);
-    } catch (e) {
-      console.error("/resend_qr error:", e.response?.data || e.message);
-      await safeSend(chatId, "⚠️ Failed to set resend flag.");
-    }
-  });
-}
-
-/* ---------------------------------------------------
-   /track <order_id> <phone> <tracking_id>
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/track\s+(\S+)\s+(\S+)\s+(\S+)/i, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const [_, orderId, phone, tracking] = match;
-    try {
-      await patch(orderId, { tracking_sent: true, status: "completed" });
-
-      await safeSend(chatId, `📦 Tracking set:\nOrder: ${orderId}\nPhone: ${phone}\nTracking ID: ${tracking}`);
-
-      const infoText =
-`📦 Track Your India Post Order
-
-Dear Customer,
-To track your India Post order, we have provided a tracking ID in the format “CLXXXXXXXXIN”.
-
-Example: CL505XX0845IN
-
-Please copy your tracking ID and paste it on the official tracking website below:
-🔗 Track Your Order Here: https://myspeedpost.com/
-
-Thank you for shopping with us! Visionsjersey.`;
-
-      await safeSend(chatId, infoText);
-    } catch (e) {
-      console.error("/track error:", e.response?.data || e.message);
-      await safeSend(chatId, "⚠️ Failed to update tracking.");
-    }
-  });
-}
-
-/* ---------------------------------------------------
-   /export_today — lists today's all orders (orders table)
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/export_today/i, async (msg) => {
-    const chatId = msg.chat.id;
-    try {
-      const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
-      const resp = await axios.get(`${SUPABASE_URL}/rest/v1/orders?created_at=gte.${encodeURIComponent(start)}&select=order_id,name,phone,amount,status`, { headers: sbHeaders });
-      const rows = resp.data || [];
-      if (!rows.length) return safeSend(chatId, "📭 No orders today.");
-      let txt = "📄 Today Orders:\n\n";
-      rows.forEach((o) => {
-        txt += `• ${o.order_id} | ${o.name || ""} | ₹${o.amount || 0} | ${o.status || ""}\n`;
-      });
-      await safeSend(chatId, txt);
-    } catch (e) {
-      console.error("/export_today error:", e.response?.data || e.message);
-      await safeSend(chatId, "⚠️ Failed to export today's orders.");
-    }
-  });
-}
-
-/* ---------------------------------------------------
-   /today — uses paid_order_items primary source
---------------------------------------------------- */
-if (bot) {
-  bot.onText(/\/today/i, async (msg) => {
-    const chatId = msg.chat.id;
-    let todayKey;
-    try {
-      todayKey = DateTime.now().setZone(TIMEZONE).toISODate();
-    } catch (_) {
-      todayKey = new Date().toISOString().slice(0, 10);
-    }
-    if (clearedTodayDate === todayKey) {
-      return safeSend(chatId, "✅ Today's orders were cleared from /today view.");
-    }
-
-    try {
-      // use paid_order_items table (primary source) to list today's paid
-      const r = await axios.get(
-        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,product_name,quantity,line_total,created_at`,
-        { headers: sbHeaders }
-      );
-      const rows = (r.data || []).filter((x) => true);
-      if (!rows.length) return safeSend(chatId, "📭 No paid orders yet today.");
-      // Group by ted
+      saved.forEach((r, idx) => {
+        // show day (dd/LL/yyyy) as requested
         let dateStr = r.created_at || "";
         try {
           dateStr = DateTime.fromISO(r.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
@@ -741,6 +556,7 @@ if (bot) {
 
 /* ---------------------------------------------------
    /today
+   - lists today's paid orders using paid_order_items table
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/today/i, async (msg) => {
@@ -761,7 +577,7 @@ if (bot) {
         `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,amount,created_at`,
         { headers: sbHeaders }
       );
-      const rows = (r.data || []).filter((x) => true);
+      const rows = (r.data || []);
       if (!rows.length) return safeSend(chatId, "📭 No paid orders yet today.");
       let text = "📅 Today’s Paid Orders\n\n";
       rows.forEach((o) => {
