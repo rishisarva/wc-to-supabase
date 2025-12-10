@@ -313,11 +313,38 @@ async function handleMarkPaid(chatId, orderId) {
   }
 
   // 5) Send supplier format and today's list
-  const supplierText =
-`📦 NEW PAID ORDER
+  // -------------------------------------------
+// Build supplier format using multi-item arrays
+// -------------------------------------------
+let skuList = [];
+let productList = [];
+
+try {
+  const skus = (order.sku || "").split(",");        // ["VJ90","VJ10"]
+  const products = (order.product || "").split("|"); // ["P1","P2"]
+  const sizes = (order.size || "").split(",");       // ["l","m"]
+  const techs = (order.technique || "").split(",");  // ["emb","emb"]
+
+  for (let i = 0; i < skus.length; i++) {
+    const s = skus[i]?.trim() || "";
+    const p = products[i]?.trim() || "";
+    const size = sizes[i]?.trim() || "";
+    const tech = techs[i]?.trim() || "";
+
+    skuList.push(`${i + 1}. ${s}`);
+    productList.push(
+      `${i + 1}. ${p} • size: ${size.toUpperCase()} • Technique: ${tech}`
+    );
+  }
+} catch (err) {
+  console.log("Multi-item format error:", err);
+}
+
+const supplierText = `
+📦 NEW PAID ORDER
 
 From:
-Vision Jerseys 
+Vision Jerseys
 +91 93279 05965
 
 To:
@@ -326,22 +353,17 @@ Address: ${order.address || ""}
 State: ${order.state || ""}
 Pincode: ${order.pincode || ""}
 Phone: ${order.phone || ""}
-SKU ID: ${order.sku || ""}
 
-Product: ${order.product || ""}
-Size: ${order.sizes || ""}
-Technique: ${order.technique || ""}
-Quantity: ${order.quantity || ""}
+SKU ID:
+${skuList.join("\n")}
 
-Shipment Mode: Normal`;
+Product:
+${productList.join("\n")}
 
-  try {
-    if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
-    await safeSend(chatId, supplierText);
-  } catch (e) {
-    console.error("failed to send supplier message:", e?.message || e);
-  }
+Quantity: ${order.quantity || 1}
 
+Shipment Mode: Normal
+`;
   // 6) Build today's paid list from paid_order_items (primary source)
   let listText = "";
   try {
