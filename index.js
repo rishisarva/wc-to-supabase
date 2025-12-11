@@ -267,9 +267,12 @@ if (bot) {
 /resend_qr <order_id> - flag for AutoJS
 /track <order_id> <phone> <tracking_id>
 /export_today - list today's orders (created_at)
- /today - list today's paid orders (paid_order_items)
- /clear_today - hide today's paid view (local only)
- /paidorders - choose date (D-3..D+3)
+/today - list today's paid orders (paid_order_items)
+/clear_today - hide today's paid view (local only)
+/paidorders - choose date (D-3..D+3)
+
+/delete_today_preview - preview which paid_order_items will be deleted (safe)
+/delete_today_confirm - permanently delete today's paid_order_items (and related orders)
 `;
     await safeSend(chatId, text);
   });
@@ -371,7 +374,6 @@ async function handleMarkPaid(chatId, orderId) {
     try { dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { dayKey = new Date().toISOString().slice(0, 10); }
 
     // We insert a single row summarizing the order into paid_order_items.
-    // (If you want per-item rows, we can change to insert one row per item.)
     const paidItem = {
       day: dayKey,
       order_id: order.order_id || String(orderId),
@@ -390,26 +392,31 @@ async function handleMarkPaid(chatId, orderId) {
 
   // 5) Build supplier format EXACT requested layout
   try {
-    // Build SKU list numbered
+    // Build SKU list numbered formatted exactly like "1.VJ90" (no extra space after dot) per your example
     const skuLines = [];
     const productLines = [];
     // If items empty but order.product present, attempt splitting again
     if (!items.length && order.product) {
       const prods = (order.product + "").split("|").map(s => s.trim()).filter(Boolean);
       const sks = (order.sku + "").split("|").map(s => s.trim()).filter(Boolean);
+      const sizesArr = (order.sizes || "").split(",").map(s => s.trim()).filter(Boolean);
+      const techArr = (order.technique || "").split(",").map(s => s.trim()).filter(Boolean);
       for (let i = 0; i < Math.max(prods.length, sks.length); i++) {
-        skuLines.push(`${i + 1}. ${sks[i] || "-"}`);
-        productLines.push(`${i + 1}. ${prods[i] || "-"} • size: ${((order.sizes || "").split(",")[i] || "").toUpperCase()} • Technique: ${((order.technique || "").split(",")[i] || "")}`);
+        skuLines.push(`${i + 1}.${(sks[i] || "-")}`); // e.g. "1.VJ90"
+        const sizeTxt = (sizesArr[i] || sizesArr[0] || "").toUpperCase();
+        const techTxt = (techArr[i] || "").replace(/-/g, " ");
+        productLines.push(`${i + 1}. ${prods[i] || "-"} • size: ${sizeTxt} • Technique: ${techTxt}`);
       }
     } else {
       items.forEach((it, idx) => {
-        skuLines.push(`${idx + 1}. ${it.sku || "-"}`);
+        skuLines.push(`${idx + 1}.${(it.sku || "-")}`); // "1.VJ90"
         const sizeFmt = (it.size || "").toString() ? ` • size: ${String(it.size).toUpperCase()}` : "";
-        const techFmt = (it.technique || "").toString() ? ` • Technique: ${it.technique}` : "";
+        const techFmt = (it.technique || "").toString() ? ` • Technique: ${it.technique.replace(/-/g, " ")}` : "";
         productLines.push(`${idx + 1}. ${it.name || "-"}${sizeFmt}${techFmt}`);
       });
     }
 
+    // Join product lines with a blank line between items (per your example)
     const supplierText =
 `📦 NEW PAID ORDER
 
@@ -668,7 +675,75 @@ if (BASE_URL) {
   });
 }
 
-// ---------------- CRON / REMINDERS (manual GET trigger)
+/* --------------------
+   Delete-today helpers (preview + confirm)
+   - preview shows number of rows and a sample
+   - confirm deletes paid_order_items for today and also deletes orders rows that match those order_ids
+---------------------*/
+async function fetchPaidItemsForDay(dayKey) {
+  const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=id,order_id,name,amount,sku,created_at`, { headers: sbHeaders });
+  return r.data || [];
+}
+
+if (bot) {
+  // preview
+  bot.onText(/\/delete_today_preview/i, async (msg) => {
+    const chatId = msg.chat.id;
+    let dayKey;
+    try { dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { dayKey = new Date().toISOString().slice(0,10); }
+    try {
+      const rows = await fetchPaidItemsForDay(dayKey);
+      if (!rows.length) return safeSend(chatId, `No paid_order_items found for today (${dayKey}).`);
+      // show count + first 5 rows as sample
+      let sample = rows.slice(0, 5).map((r, idx) => `${idx+1}. ${r.name} (${r.order_id}) ₹${r.amount}`).join("\n");
+      await safeSend(chatId, `Preview delete for ${dayKey}:\nTotal rows: ${rows.length}\n\nSample:\n${sample}\n\nIf OK run /delete_today_confirm to delete permanently.`);
+    } catch (e) {
+      console.error("/delete_today_preview error:", e?.response?.data || e?.message || e);
+      await safeSend(chatId, "⚠️ Failed to preview today's paid_order_items.");
+    }
+  });
+
+  // confirm - perform deletion
+  bot.onText(/\/delete_today_confirm/i, async (msg) => {
+    const chatId = msg.chat.id;
+    let dayKey;
+    try { dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { dayKey = new Date().toISOString().slice(0,10); }
+    try {
+      const rows = await fetchPaidItemsForDay(dayKey);
+      if (!rows.length) return safeSend(chatId, `No paid_order_items found for today (${dayKey}). Nothing to delete.`);
+
+      // collect order_ids to also delete from orders (if present)
+      const orderIds = Array.from(new Set(rows.map(r => r.order_id).filter(Boolean)));
+
+      // 1) delete paid_order_items rows for today
+      // Supabase REST supports DELETE with filter
+      const delPaidUrl = `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}`;
+      await axios.delete(delPaidUrl, { headers: sbHeaders });
+      // 2) delete matching orders rows (best-effort) — delete orders where order_id IN (...) and paid_at is today OR status=paid
+      let deletedOrdersCount = 0;
+      if (orderIds.length) {
+        // loop delete each order_id (safer than trying a complex REST filter)
+        for (const oid of orderIds) {
+          try {
+            // delete from orders where order_id=oid
+            await axios.delete(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(oid)}`, { headers: sbHeaders });
+            deletedOrdersCount++;
+          } catch (e) {
+            // continue even if some deletes fail
+            console.warn("Failed to delete order", oid, e?.response?.data || e?.message || e);
+          }
+        }
+      }
+
+      await safeSend(chatId, `✅ Deleted ${rows.length} paid_order_items rows for ${dayKey}. Deleted ${deletedOrdersCount} matching orders (attempted).`);
+    } catch (e) {
+      console.error("/delete_today_confirm error:", e?.response?.data || e?.message || e);
+      await safeSend(chatId, "⚠️ Failed to delete today's paid_order_items.");
+    }
+  });
+}
+
+/* ---------------- CRON / REMINDERS (manual GET trigger) ---------------- */
 app.get("/cron-check", async (req, res) => {
   try {
     const orders = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.pending_payment&select=*`, { headers: sbHeaders, timeout: 15000 });
