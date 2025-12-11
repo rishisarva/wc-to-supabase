@@ -1,5 +1,6 @@
-// index.js — VisionsJersey automation (Final: webhook mode, multi-item, technique/sizes)
-// 2025-12 - Finalized
+// index.js — VisionsJersey automation (Final: robust multi-item, webhook/polling safe)
+// 2025-12 - Finalized: handles multi-item orders, sizes & technique extraction,
+// inserts into paid_order_items, robust fallbacks when columns differ.
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -13,10 +14,10 @@ app.use(bodyParser.json({ limit: "10mb" }));
 // ---------------- ENV ----------------
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON = process.env.SUPABASE_ANON;
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || null;
 const SUPPLIER_CHAT_ID = process.env.SUPPLIER_CHAT_ID || null;
 const TIMEZONE = process.env.TIMEZONE || "Asia/Kolkata";
-const BASE_URL = process.env.BASE_URL || null; // e.g. https://wc-to-supabase.onrender.com
+const BASE_URL = process.env.BASE_URL || null; // if set, we use webhook mode for Telegram
 
 // WooCommerce Keys (optional)
 const WC_USER = process.env.WC_KEY || "";
@@ -26,9 +27,6 @@ if (!SUPABASE_URL || !SUPABASE_ANON) {
   console.error("❌ Missing SUPABASE_URL or SUPABASE_ANON environment variable.");
   process.exit(1);
 }
-if (!TELEGRAM_TOKEN) {
-  console.warn("⚠️ TELEGRAM_TOKEN not set — Telegram functionality disabled.");
-}
 
 const sbHeaders = {
   apikey: SUPABASE_ANON,
@@ -37,23 +35,28 @@ const sbHeaders = {
   Prefer: "return=representation"
 };
 
-// in-memory flag to "clear" today's orders from /today (does NOT touch DB)
-let clearedTodayDate = null;
-
-// ---------------- Telegram (webhook mode) ----------------
+// ---------------- Telegram setup (webhook preferred) ----------------
 let bot = null;
 if (TELEGRAM_TOKEN) {
-  bot = new TelegramBot(TELEGRAM_TOKEN);
-  if (!BASE_URL) {
-    console.warn("⚠️ BASE_URL not set — Telegram webhook will not be registered automatically. Set BASE_URL env to register webhook.");
-  } else {
+  if (BASE_URL) {
+    bot = new TelegramBot(TELEGRAM_TOKEN);
     const hookUrl = `${BASE_URL.replace(/\/$/, "")}/telegram-webhook`;
     bot
       .setWebHook(hookUrl)
       .then(() => console.log("✅ Telegram webhook set:", hookUrl))
       .catch((err) => console.warn("⚠️ Failed to set Telegram webhook:", err?.message || err));
+    console.log("🤖 Telegram Bot Ready (webhook mode)");
+  } else {
+    // polling fallback with safer error handling
+    bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+    bot.on("polling_error", (err) => {
+      console.error("Telegram polling_error:", err?.response?.body || err?.code || err?.message || err);
+      // don't crash; log only
+    });
+    console.log("🤖 Telegram Bot Ready (polling mode)");
   }
-  console.log("🤖 Telegram Bot Ready (webhook mode)");
+} else {
+  console.warn("⚠️ TELEGRAM_TOKEN missing — bot disabled.");
 }
 
 // ---------------- Helpers ----------------
@@ -80,83 +83,136 @@ async function safeSend(chatId, text) {
 }
 
 // ---------------- HEALTH ----------------
-app.get("/", (req, res) => res.send("🔥 WC → Supabase Automation Live (webhook mode)"));
+app.get("/", (req, res) => res.send("🔥 WC → Supabase Automation Live (final)"));
 
-// ---------------- TELEGRAM WEBHOOK RECEIVER ----------------
-app.post("/telegram-webhook", (req, res) => {
-  if (!bot) return res.sendStatus(501);
+/* -------------------
+   Utilities: parse incoming order items robustly
+   Returns array of items: { sku, name, quantity, size, technique }
+---------------------*/
+function extractItemsFromIncoming(order) {
+  // Try multiple shapes: order.items (JSON string), order.line_items array, or nested structures.
+  let rawItems = [];
+
   try {
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
-  } catch (e) {
-    console.error("telegram webhook processUpdate error:", e?.message || e);
-    res.sendStatus(500);
-  }
-});
+    if (order.items) {
+      // items might already be JSON string or array
+      if (typeof order.items === "string") {
+        try {
+          rawItems = JSON.parse(order.items) || [];
+        } catch (_) {
+          // fallback: maybe it's already a stringified array with single quotes — ignore
+          rawItems = [];
+        }
+      } else if (Array.isArray(order.items)) {
+        rawItems = order.items;
+      }
+    }
+  } catch (_) { rawItems = []; }
 
-// ---------------- WEBHOOK INSERT (Woo → Supabase) ----------------
-/*
-  Expect WooCommerce to POST JSON with `order` object in body.
-  This handler maps multi-line items, extracts `sizes` and `technique` from item meta,
-  and stores `items` JSON into orders table.
-*/
-app.post("/woocommerce-webhook", async (req, res) => {
-  try {
-    const order = req.body.order || req.body; // accept both shapes
-    if (!order) return res.status(200).send("NO ORDER");
+  // fallback to known Woo structures
+  if (!rawItems.length && Array.isArray(order.line_items)) rawItems = order.line_items;
 
-    // extract line_items which might be array
-    const items = Array.isArray(order.line_items) ? order.line_items : [];
+  if (!rawItems.length && Array.isArray(order.line_items_data)) rawItems = order.line_items_data;
 
-    // build flattened product names, skus and gather sizes/technique values (if present)
-    const productNames = [];
-    const skus = [];
-    const sizesFound = new Set();
-    const techniqueFound = new Set();
+  // Final fallback: if body itself looks like a woo 'order' with 'line_items' inside nested shapes
+  if (!rawItems.length && order?.order && Array.isArray(order.order.line_items)) rawItems = order.order.line_items;
 
-    items.forEach((it) => {
-      try {
-        productNames.push(it.name || "");
-        if (it.sku) skus.push(it.sku);
-        // meta may be in different shapes
-        const meta = it.meta || it.meta_data || it.meta_data || [];
-        const metaItems = Array.isArray(meta) ? meta : [];
-        metaItems.forEach((m) => {
-          const k = (m.key || m.name || "").toString().toLowerCase();
-          const v = (m.value || m.display_value || m.option || m.label || "").toString();
-          if (!v) return;
-          if (k.includes("size") || k === "pa_sizes" || k === "sizes") {
-            sizesFound.add(v);
-          }
-          if (k.includes("technique") || k === "technique") {
-            techniqueFound.add(v);
-          }
-        });
-      } catch (_) {}
+  // Map each raw item to our normalized shape
+  const items = (rawItems || []).map((it) => {
+    const name = it.name || it.product_name || it.title || "";
+    const sku = it.sku || it.sku_id || (it.skuId ? String(it.skuId) : "") || "";
+    const quantity = Number(it.quantity || it.qty || 1);
+    let size = "";
+    let technique = "";
+
+    // meta / meta_data may be array or object
+    const metaCandidates = it.meta || it.meta_data || it.metaData || it.meta_items || [];
+    const metas = Array.isArray(metaCandidates) ? metaCandidates : [];
+
+    metas.forEach((m) => {
+      const key = ((m.key || m.name || m.label || "") + "").toLowerCase();
+      const val = (m.value || m.display_value || m.option || m.label || "") + "";
+      if (!val) return;
+      if (key.includes("size") || key === "pa_sizes" || key === "sizes") {
+        if (!size) size = val;
+      } else if (key.includes("technique") || key === "technique") {
+        if (!technique) technique = val;
+      } else {
+        // some plugins store attributes as {name: 'Attribute', option: 'L'} etc.
+        if ((m.name || "").toLowerCase().includes("size") && !size) size = m.option || m.value || "";
+        if ((m.name || "").toLowerCase().includes("technique") && !technique) technique = m.option || m.value || "";
+      }
     });
 
+    // Some shops put attributes on item.attributes array
+    const attrs = it.attributes || it.variation || it.attributes_data || [];
+    if (!size && Array.isArray(attrs)) {
+      attrs.forEach((a) => {
+        const aKey = ((a.name || a.key || "") + "").toLowerCase();
+        const aVal = (a.option || a.value || "") + "";
+        if (!aVal) return;
+        if (aKey.includes("size") && !size) size = aVal;
+        if (aKey.includes("technique") && !technique) technique = aVal;
+      });
+    }
+
+    // final attempt: if item has 'options' or 'display' strings
+    if (!size && it.display && it.display.toLowerCase().includes("size:")) {
+      const m = it.display.match(/size:\s*([^\n,;]+)/i);
+      if (m) size = m[1].trim();
+    }
+
+    return {
+      sku: (sku + "").trim(),
+      name: (name + "").trim(),
+      quantity: quantity || 1,
+      size: (size + "").trim(),
+      technique: (technique + "").trim()
+    };
+  });
+
+  return items;
+}
+
+/* -------------------------------
+   /woocommerce-webhook
+   Accepts Woo order JSON, maps to orders table with items JSON, sizes, technique aggregated.
+---------------------------------*/
+app.post("/woocommerce-webhook", async (req, res) => {
+  try {
+    const order = req.body.order || req.body || {}; // support both shapes
+    if (!order) return res.status(200).send("NO ORDER");
+
+    const items = extractItemsFromIncoming(order) || [];
+
+    // Gather aggregated fields
+    const productNames = items.map((it) => it.name).filter(Boolean);
+    const skus = items.map((it) => it.sku).filter(Boolean);
+    const sizesSet = new Set(items.map((it) => it.size).filter(Boolean));
+    const techniqueSet = new Set(items.map((it) => it.technique).filter(Boolean));
+    const totalQty = items.reduce((s, it) => s + (it.quantity || 1), 0);
+
+    // billing extraction flexible
+    const billing = order.billing_address || order.billing || order.billing_address || {};
+
     const mapped = {
-      order_id: String(order.id || order.order_id || ""),
-      name: (order.billing_address?.first_name || order.billing?.first_name || order.billing?.name || "").toString(),
-      phone: (order.billing_address?.phone || order.billing?.phone || "").toString(),
-      email: (order.billing_address?.email || order.billing?.email || "").toString(),
-      amount: Number(order.total || order.total_amount || 0),
+      order_id: String(order.id || order.order_id || order.number || ""),
+      name: (billing.first_name || billing.name || billing.full_name || "") + "",
+      phone: (billing.phone || billing.phone_number || "") + "",
+      email: (billing.email || "") + "",
+      amount: Number(order.total || order.total_amount || order.order_total || 0) || 0,
       product: productNames.join(" | "),
       sku: skus.join(" | "),
-      // sizes & technique fields are aggregated as comma separated
-      sizes: Array.from(sizesFound).join(", "),
-      technique: Array.from(techniqueFound).join(", "),
-      // address fields if present
-      address: (order.billing_address?.address_1 || order.billing?.address_1 || "").toString(),
-      state: (order.billing_address?.state || order.billing?.state || "").toString(),
-      pincode: (order.billing_address?.postcode || order.billing?.postcode || "").toString(),
-      quantity: order.total_line_items_quantity || items.reduce((s, it) => s + (it.quantity || 0), 0) || 1,
+      sizes: Array.from(sizesSet).join(", "),
+      technique: Array.from(techniqueSet).join(", "),
+      address: billing.address_1 || billing.address || "",
+      state: billing.state || "",
+      pincode: billing.postcode || billing.postal_code || "",
+      quantity: totalQty,
 
-      // status fields
       status: "pending_payment",
       created_at: nowISO(),
 
-      // messaging flags
       message_sent: false,
       next_message: "reminder_24h",
       reminder_24_sent: false,
@@ -170,7 +226,6 @@ app.post("/woocommerce-webhook", async (req, res) => {
       tracking_sent: false,
       hidden_from_today: false,
 
-      // previous_* fields
       previous_status: null,
       previous_paid_at: null,
       previous_amount: null,
@@ -179,17 +234,21 @@ app.post("/woocommerce-webhook", async (req, res) => {
       previous_reminder_48_sent: null,
       previous_reminder_72_sent: null,
 
-      // save full items JSON for auditing
+      // Save raw items for auditing (string)
       items: JSON.stringify(items)
     };
 
-    // Insert into Supabase orders table
-    await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
+    // Attempt insert
+    try {
+      await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
+    } catch (insertErr) {
+      console.error("Supabase insert (orders) error:", insertErr?.response?.data || insertErr?.message || insertErr);
+      // still ACK Woo
+    }
 
     return res.status(200).send("OK");
   } catch (err) {
     console.error("WEBHOOK ERROR:", err?.response?.data || err?.message || err);
-    // return 200 to acknowledge Woo but log details
     return res.status(200).send("ERR");
   }
 });
@@ -203,48 +262,35 @@ if (bot) {
     const text =
 `VisionsJersey Bot Commands:
 
-/order <order_id>
-- Show panel with actions: Mark Paid / Resend QR / Track / Cancel
-
-/paid <order_id>
-- Mark order as paid
-- WooCommerce → processing
-- Supabase → status paid + thank-you pending
-- Sends supplier format
-- Saves paid item to paid_order_items (today) and sends today's paid list
-
-/resend_qr <order_id>
-- Trigger AutoJS to resend QR + pending message
-
+/order <order_id> - show order panel
+/paid <order_id> - mark paid, woo->processing, send supplier format & today's list
+/resend_qr <order_id> - flag for AutoJS
 /track <order_id> <phone> <tracking_id>
-- Mark order completed in Supabase and reply tracking text
-
-/export_today - list today's orders
-/today - show today's paid orders
-/clear_today - hide today's paid orders from /today (view only)
-/paidorders - choose date (D-3..D+3) to view paid orders
+/export_today - list today's orders (created_at)
+ /today - list today's paid orders (paid_order_items)
+ /clear_today - hide today's paid view (local only)
+ /paidorders - choose date (D-3..D+3)
 `;
     await safeSend(chatId, text);
   });
 }
 
 /* ---------------------------------------------------
-   Core: mark paid logic (shared)
-   Insert into paid_order_items table using day = YYYY-MM-DD (TimeZone)
+   Core: mark paid logic
 --------------------------------------------------- */
 async function handleMarkPaid(chatId, orderId) {
   console.log("handleMarkPaid:", orderId);
-
-  // 1) Fetch order
+  // 1) Fetch order (robust)
   let fetchRes;
   try {
     fetchRes = await axios.get(
       `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`,
       { headers: sbHeaders }
     );
-  } catch (e) {
-    console.error("fetch order error:", e?.response?.data || e?.message || e);
-    return safeSend(chatId, `❌ Failed fetching ${orderId}.`);
+  } catch (err) {
+    console.error("fetch order error:", err?.response?.data || err?.message || err);
+    await safeSend(chatId, `❌ Failed fetching ${orderId}.`);
+    return;
   }
 
   if (!fetchRes?.data?.length) {
@@ -265,6 +311,8 @@ async function handleMarkPaid(chatId, orderId) {
     } catch (e) {
       console.error("WooCommerce update failed:", e?.response?.data || e?.message || e);
     }
+  } else {
+    console.log("WC credentials not configured; skipping Woo update.");
   }
 
   // 3) Update Supabase -> mark paid
@@ -287,23 +335,51 @@ async function handleMarkPaid(chatId, orderId) {
     console.error("Supabase patch (paid) failed:", e?.response?.data || e?.message || e);
   }
 
+  // Normalize items either from order fields or parse saved items JSON
+  let items = [];
+  try {
+    if (order.items) {
+      try { items = JSON.parse(order.items); } catch (_) { items = extractItemsFromIncoming(order); }
+    } else {
+      // if order.product/sku contain delimited values, attempt to recreate
+      items = extractItemsFromIncoming(order);
+    }
+    if (!items.length && order.product && order.sku) {
+      // try splitting by '|' or ',' heuristics
+      const prods = (order.product + "").split("|").map(s => s.trim()).filter(Boolean);
+      const sks = (order.sku + "").split("|").map(s => s.trim()).filter(Boolean);
+      const sizes = (order.sizes || "").split(",").map(s => s.trim()).filter(Boolean);
+      const techs = (order.technique || "").split(",").map(s => s.trim()).filter(Boolean);
+      for (let i = 0; i < Math.max(prods.length, sks.length); i++) {
+        items.push({
+          name: prods[i] || "",
+          sku: sks[i] || "",
+          quantity: 1,
+          size: sizes[i] || sizes[0] || "",
+          technique: techs[i] || techs[0] || ""
+        });
+      }
+    }
+  } catch (e) {
+    console.error("items normalization error:", e);
+    items = [];
+  }
+
   // 4) Insert into paid_order_items (day = today)
   try {
     let dayKey;
-    try {
-      dayKey = DateTime.now().setZone(TIMEZONE).toISODate();
-    } catch (_) {
-      dayKey = new Date().toISOString().slice(0, 10);
-    }
+    try { dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { dayKey = new Date().toISOString().slice(0, 10); }
 
+    // We insert a single row summarizing the order into paid_order_items.
+    // (If you want per-item rows, we can change to insert one row per item.)
     const paidItem = {
       day: dayKey,
       order_id: order.order_id || String(orderId),
       name: order.name || "",
       amount: order.amount || 0,
-      sku: order.sku || "",
-      sizes: order.sizes || "",
-      technique: order.technique || "",
+      sku: (items.map(i => i.sku).filter(Boolean).join(" | ")) || (order.sku || ""),
+      sizes: (items.map(i => i.size).filter(Boolean).join(", ")) || (order.sizes || ""),
+      technique: (items.map(i => i.technique).filter(Boolean).join(", ")) || (order.technique || ""),
       created_at: nowISO()
     };
 
@@ -312,39 +388,33 @@ async function handleMarkPaid(chatId, orderId) {
     console.error("Insert paid_order_items failed:", e?.response?.data || e?.message || e);
   }
 
-  // 5) Send supplier format and today's list
-  // -------------------------------------------
-// Build supplier format using multi-item arrays
-// -------------------------------------------
-let skuList = [];
-let productList = [];
+  // 5) Build supplier format EXACT requested layout
+  try {
+    // Build SKU list numbered
+    const skuLines = [];
+    const productLines = [];
+    // If items empty but order.product present, attempt splitting again
+    if (!items.length && order.product) {
+      const prods = (order.product + "").split("|").map(s => s.trim()).filter(Boolean);
+      const sks = (order.sku + "").split("|").map(s => s.trim()).filter(Boolean);
+      for (let i = 0; i < Math.max(prods.length, sks.length); i++) {
+        skuLines.push(`${i + 1}. ${sks[i] || "-"}`);
+        productLines.push(`${i + 1}. ${prods[i] || "-"} • size: ${((order.sizes || "").split(",")[i] || "").toUpperCase()} • Technique: ${((order.technique || "").split(",")[i] || "")}`);
+      }
+    } else {
+      items.forEach((it, idx) => {
+        skuLines.push(`${idx + 1}. ${it.sku || "-"}`);
+        const sizeFmt = (it.size || "").toString() ? ` • size: ${String(it.size).toUpperCase()}` : "";
+        const techFmt = (it.technique || "").toString() ? ` • Technique: ${it.technique}` : "";
+        productLines.push(`${idx + 1}. ${it.name || "-"}${sizeFmt}${techFmt}`);
+      });
+    }
 
-try {
-  const skus = (order.sku || "").split(",");        // ["VJ90","VJ10"]
-  const products = (order.product || "").split("|"); // ["P1","P2"]
-  const sizes = (order.size || "").split(",");       // ["l","m"]
-  const techs = (order.technique || "").split(",");  // ["emb","emb"]
-
-  for (let i = 0; i < skus.length; i++) {
-    const s = skus[i]?.trim() || "";
-    const p = products[i]?.trim() || "";
-    const size = sizes[i]?.trim() || "";
-    const tech = techs[i]?.trim() || "";
-
-    skuList.push(`${i + 1}. ${s}`);
-    productList.push(
-      `${i + 1}. ${p} • size: ${size.toUpperCase()} • Technique: ${tech}`
-    );
-  }
-} catch (err) {
-  console.log("Multi-item format error:", err);
-}
-
-const supplierText = `
-📦 NEW PAID ORDER
+    const supplierText =
+`📦 NEW PAID ORDER
 
 From:
-Vision Jerseys
+Vision Jerseys 
 +91 93279 05965
 
 To:
@@ -355,63 +425,60 @@ Pincode: ${order.pincode || ""}
 Phone: ${order.phone || ""}
 
 SKU ID:
-${skuList.join("\n")}
+${skuLines.length ? skuLines.join("\n") : (order.sku || "-")}
 
 Product:
-${productList.join("\n")}
+${productLines.length ? productLines.join("\n\n") : (order.product || "-")}
 
-Quantity: ${order.quantity || 1}
+Quantity: ${order.quantity || items.reduce((s, it) => s + (it.quantity || 1), 0) || 1}
 
 Shipment Mode: Normal
 `;
-  // 6) Build today's paid list from paid_order_items (primary source)
-  let listText = "";
+
+    // send to supplier + admin chat (safe)
+    if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
+    // send to caller/chatId
+    await safeSend(chatId, supplierText);
+  } catch (e) {
+    console.error("Failed to build/send supplier text:", e?.message || e);
+  }
+
+  // 6) Build today's paid list (source: paid_order_items table)
   try {
     let dayKey;
-    try {
-      dayKey = DateTime.now().setZone(TIMEZONE).toISODate();
-    } catch (_) {
-      dayKey = new Date().toISOString().slice(0, 10);
-    }
+    try { dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { dayKey = new Date().toISOString().slice(0, 10); }
 
     const paidItemsRes = await axios.get(
       `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=order_id,name,amount,created_at,sku,sizes,technique`,
-      { headers: sbHeaders }
+      { headers: sbHeaders, timeout: 10000 }
     );
     const saved = paidItemsRes.data || [];
 
     let headerDate;
-    try {
-      headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd");
-    } catch (_) {
-      headerDate = new Date().toISOString().slice(0, 10);
-    }
+    try { headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd"); } catch (_) { headerDate = new Date().toISOString().slice(0, 10); }
 
-    listText = `${headerDate} orders 🌼\n\n`;
+    let listText = `${headerDate} orders 🌼\n\n`;
     if (!saved.length) {
       listText += "No paid orders for today yet.";
     } else {
       saved.forEach((r, idx) => {
         let dateStr = r.created_at || "";
-        try {
-          dateStr = DateTime.fromISO(r.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
-        } catch (_) {}
-        listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) ₹${r.amount} | SKU:${r.sku || "-"} | Size:${r.sizes || "-"} | Tech:${r.technique || "-"} — ${dateStr}\n`;
+        try { dateStr = DateTime.fromISO(r.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
+        listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) ₹${r.amount || 0} | SKU: ${r.sku || "-"} | Size: ${r.sizes || "-"} | Tech: ${r.technique || "-"} — ${dateStr}\n`;
       });
     }
+    await safeSend(chatId, listText);
   } catch (e) {
-    console.error("Failed to build today's list from paid_order_items:", e?.response?.data || e?.message || e);
-    listText = "Today's paid list couldn't be loaded from DB.";
+    console.error("Failed to build today's list:", e?.response?.data || e?.message || e);
+    await safeSend(chatId, "Today's paid list couldn't be loaded from DB.");
   }
 
-  await safeSend(chatId, listText);
-
-  // confirmation
+  // final confirmation
   await safeSend(chatId, `✅ Order ${orderId} marked paid.\nWooCommerce → processing (attempted)\nSupabase updated.\nCustomer thank-you will be sent automatically by AutoJS.`);
 }
 
 /* ---------------------------------------------------
-   /paid command
+   /paid command (Telegram)
 --------------------------------------------------- */
 if (bot) {
   bot.onText(/\/paid\s+(.+)/i, async (msg, match) => {
@@ -428,17 +495,16 @@ if (bot) {
 }
 
 /* ---------------------------------------------------
-   /order and other commands (kept as before)
-   For brevity, only /order and /resend_qr /track /today /paidorders /clear_today /export_today
-   are included exactly as previous — but note they use paid_order_items now where appropriate.
+   Other helper commands (order panel, resend_qr, track, today, paidorders)
+   Keep behaviors consistent with paid_order_items as source where appropriate.
 --------------------------------------------------- */
-// /order
+
+// /order (panel)
 if (bot) {
   bot.onText(/\/order\s+(.+)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const orderId = match[1]?.trim();
     if (!orderId) return safeSend(chatId, "Usage: /order <order_id>");
-
     try {
       const resp = await axios.get(
         `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`,
@@ -449,14 +515,8 @@ if (bot) {
       const text = `📦 Order #${o.order_id}\n\nName: ${o.name || ""}\nAmount: ₹${o.amount || 0}\nProduct: ${o.product || ""}\nSize: ${o.sizes || ""}\nTechnique: ${o.technique || ""}`;
       const keyboard = {
         inline_keyboard: [
-          [
-            { text: "✅ Mark Paid", callback_data: `order_paid:${o.order_id}` },
-            { text: "🔁 Resend QR", callback_data: `order_resend:${o.order_id}` }
-          ],
-          [
-            { text: "📦 Track", callback_data: `order_track:${o.order_id}` },
-            { text: "❌ Cancel", callback_data: `order_cancel:${o.order_id}` }
-          ]
+          [{ text: "✅ Mark Paid", callback_data: `order_paid:${o.order_id}` }, { text: "🔁 Resend QR", callback_data: `order_resend:${o.order_id}` }],
+          [{ text: "📦 Track", callback_data: `order_track:${o.order_id}` }, { text: "❌ Cancel", callback_data: `order_cancel:${o.order_id}` }]
         ]
       };
       await bot.sendMessage(chatId, text, { reply_markup: keyboard });
@@ -498,14 +558,12 @@ if (bot) {
   });
 }
 
-// /today - use paid_order_items primary source
+// /today - show today's paid orders (paid_order_items primary)
 if (bot) {
   bot.onText(/\/today/i, async (msg) => {
     const chatId = msg.chat.id;
     let todayKey;
     try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
-    if (clearedTodayDate === todayKey) return safeSend(chatId, "✅ Today's orders were cleared from /today view.");
-
     try {
       const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,amount,sku,sizes,technique,created_at`, { headers: sbHeaders });
       const rows = r.data || [];
@@ -521,6 +579,7 @@ if (bot) {
 }
 
 // /clear_today
+let clearedTodayDate = null;
 if (bot) {
   bot.onText(/\/clear_today/i, async (msg) => {
     let todayKey;
@@ -539,26 +598,24 @@ if (bot) {
     const buttons = [];
     const row1 = [];
     for (let i = -3; i <= -1; i++) {
-      const d = base.plus({ days: i });
-      row1.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
+      const d = base.plus({ days: i }); row1.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
     }
     buttons.push(row1);
     buttons.push([{ text: "Today", callback_data: `paidorders:${base.toISODate()}` }]);
     const row3 = [];
     for (let i = 1; i <= 3; i++) {
-      const d = base.plus({ days: i });
-      row3.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
+      const d = base.plus({ days: i }); row3.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
     }
     buttons.push(row3);
     await bot.sendMessage(chatId, "📅 Choose a date to view paid orders:", { reply_markup: { inline_keyboard: buttons } });
   });
 }
 
-// callback handler for inline keyboard actions (paid, resend, cancel, paidorders date)
+// callback handler
 if (bot) {
   bot.on("callback_query", async (query) => {
     const data = query.data || "";
-    const chatId = query.message.chat.id;
+    const chatId = query.message?.chat?.id;
     try {
       if (data.startsWith("order_paid:")) {
         const orderId = data.split(":")[1]; await handleMarkPaid(chatId, orderId);
@@ -566,87 +623,8 @@ if (bot) {
         const orderId = data.split(":")[1];
         await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, { resend_qr_pending: true }, { headers: sbHeaders });
         await safeSend(chatId, `🔁 QR resend triggered for order ${orderId}.`);
-      } else if (data.startsWith("order_track:")) {
-        const orderId = data.split(":")[1]; await safeSend(chatId, `To set tracking, use:\n/track ${orderId} <phone> <tracking_id>`);
-      } else if (data.startsWith("order_cancel:")) {
-        const orderId = data.split(":")[1];
-        const keyboard = { inline_keyboard: [
-          [{ text: "🗂 Cancel only in today list", callback_data: `order_cancel_action:${orderId}:only_list` },
-           { text: "❌ Cancel in Woo+Supabase", callback_data: `order_cancel_action:${orderId}:full` }],
-          [{ text: "♻️ Restore (if cancelled)", callback_data: `order_cancel_action:${orderId}:restore` }]
-        ]};
-        await bot.sendMessage(chatId, `Choose cancel action for order ${orderId}:`, { reply_markup: keyboard });
-      } else if (data.startsWith("order_cancel_action:")) {
-        const parts = data.split(":");
-        const orderId = parts[1];
-        const action = parts[2];
-        if (action === "only_list") {
-          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, { hidden_from_today: true }, { headers: sbHeaders });
-          await safeSend(chatId, `✅ Order ${orderId} hidden from today's list.`);
-        } else if (action === "full") {
-          const fetchRes = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`, { headers: sbHeaders });
-          const rows = fetchRes.data || [];
-          if (!rows.length) return safeSend(chatId, `Order ${orderId} not found.`);
-          const o = rows[0];
-          const backup = {
-            previous_status: o.status || null,
-            previous_paid_at: o.paid_at || null,
-            previous_amount: o.amount || null,
-            previous_next_message: o.next_message || null,
-            previous_reminder_24_sent: o.reminder_24_sent || false,
-            previous_reminder_48_sent: o.reminder_48_sent || false,
-            previous_reminder_72_sent: o.reminder_72_sent || false
-          };
-          if (WC_USER && WC_PASS) {
-            try { await axios.put(`https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`, { status: "cancelled" }, { auth: { username: WC_USER, password: WC_PASS } }); } catch (e) { console.error("Woo cancel failed:", e?.message||e); }
-          }
-          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, Object.assign({
-            status: "cancelled",
-            next_message: null,
-            reminder_24_sent: true,
-            reminder_48_sent: true,
-            reminder_72_sent: true,
-            hidden_from_today: true
-          }, backup), { headers: sbHeaders });
-          await safeSend(chatId, `❌ Order ${orderId} cancelled in WooCommerce (attempted) and Supabase. Restore is available.`);
-        } else if (action === "restore") {
-          const fetchRes = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`, { headers: sbHeaders });
-          const rows = fetchRes.data || [];
-          if (!rows.length) return safeSend(chatId, `Order ${orderId} not found.`);
-          const o = rows[0];
-          if (!o.previous_status) return safeSend(chatId, `No previous state found for order ${orderId}. Cannot restore.`);
-          if (WC_USER && WC_PASS) {
-            try { await axios.put(`https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`, { status: o.previous_status }, { auth: { username: WC_USER, password: WC_PASS } }); } catch (e) { console.error("Woo restore failed:", e?.message||e); }
-          }
-          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, {
-            status: o.previous_status,
-            paid_at: o.previous_paid_at,
-            amount: o.previous_amount,
-            next_message: o.previous_next_message,
-            reminder_24_sent: o.previous_reminder_24_sent,
-            reminder_48_sent: o.previous_reminder_48_sent,
-            reminder_72_sent: o.previous_reminder_72_sent,
-            hidden_from_today: false,
-            previous_status: null,
-            previous_paid_at: null,
-            previous_amount: null,
-            previous_next_message: null,
-            previous_reminder_24_sent: null,
-            previous_reminder_48_sent: null,
-            previous_reminder_72_sent: null
-          }, { headers: sbHeaders });
-          await safeSend(chatId, `♻️ Order ${orderId} restored to previous status.`);
-        } else {
-          await safeSend(chatId, "Unknown cancel action.");
-        }
       } else if (data.startsWith("paidorders:")) {
         const dateKey = data.split(":")[1];
-        let start, end;
-        try {
-          const d = DateTime.fromISO(dateKey, { zone: TIMEZONE });
-          start = d.startOf("day").toUTC().toISO(); end = d.plus({ days: 1 }).startOf("day").toUTC().toISO();
-        } catch (_) { const d = DateTime.now(); start = d.toISO(); end = d.plus({ days: 1 }).toISO(); }
-        // primary source: paid_order_items
         try {
           const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dateKey)}&select=order_id,name,amount,created_at,sku,sizes,technique`, { headers: sbHeaders });
           const rows = r.data || [];
@@ -654,30 +632,15 @@ if (bot) {
           if (!rows.length) header += "No paid orders on this date.";
           else {
             rows.forEach((o, idx) => {
-              let dateStr = o.created_at; try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-              header += `${idx + 1}. ${o.name || ""} (${o.order_id}) ₹${o.amount} | SKU:${o.sku||"-"} | Size:${o.sizes||"-"} | Tech:${o.technique||"-"} — ${dateStr}\n`;
+              let dateStr=o.created_at||"";
+              try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
+              header += `${idx+1}. ${o.name||""} (${o.order_id}) ₹${o.amount||0} | SKU:${o.sku||"-"} | Size:${o.sizes||"-"} | Tech:${o.technique||"-"} — ${dateStr}\n`;
             });
           }
           await safeSend(chatId, header);
         } catch (e) {
-          console.error("paidorders fetch error (paid_order_items):", e?.response?.data || e?.message || e);
-          // fallback to orders table
-          try {
-            const r2 = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&paid_at=lt.${encodeURIComponent(end)}&select=order_id,name,amount,paid_at,hidden_from_today`, { headers: sbHeaders });
-            let rows = (r2.data || []).filter((x) => !x.hidden_from_today);
-            let header = `${dateKey} paid orders 🌼\n\n`;
-            if (!rows.length) header += "No paid orders on this date.";
-            else {
-              rows.forEach((o, idx) => {
-                let dateStr = o.paid_at; try { dateStr = DateTime.fromISO(o.paid_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-                header += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦 # ${dateStr}\n`;
-              });
-            }
-            await safeSend(chatId, header);
-          } catch (e2) {
-            console.error("paidorders fallback error:", e2?.response?.data || e2?.message || e2);
-            await safeSend(chatId, "⚠️ Failed to fetch paid orders for that date.");
-          }
+          console.error("paidorders callback error:", e?.response?.data || e?.message || e);
+          await safeSend(chatId, "⚠️ Failed to fetch paid orders for that date.");
         }
       } else {
         await bot.answerCallbackQuery(query.id, { text: "Action received" });
@@ -691,14 +654,25 @@ if (bot) {
   });
 }
 
-/* ---------------------------------------------------
-   CRON / REMINDERS — run via your cron hitting /cron-check
-   It patches reminder flags and cancels at 72h
---------------------------------------------------- */
+// If webhook mode: accept telegram webhook route
+if (BASE_URL) {
+  app.post("/telegram-webhook", (req, res) => {
+    if (!bot) return res.sendStatus(501);
+    try {
+      bot.processUpdate(req.body);
+      res.sendStatus(200);
+    } catch (e) {
+      console.error("telegram webhook processUpdate error:", e?.message || e);
+      res.sendStatus(500);
+    }
+  });
+}
+
+// ---------------- CRON / REMINDERS (manual GET trigger)
 app.get("/cron-check", async (req, res) => {
   try {
-    const orders = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.pending_payment&select=*`, { headers: sbHeaders });
-    for (const o of orders.data) {
+    const orders = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.pending_payment&select=*`, { headers: sbHeaders, timeout: 15000 });
+    for (const o of orders.data || []) {
       const h = hoursSince(o.created_at);
       if (!o.reminder_24_sent && h >= 24) await patch(o.order_id, { reminder_24_sent: true, next_message: "reminder_48h" });
       if (!o.reminder_48_sent && h >= 48) await patch(o.order_id, { reminder_48_sent: true, discounted_amount: (o.amount || 0) - 30, next_message: "reminder_72h" });
@@ -711,16 +685,19 @@ app.get("/cron-check", async (req, res) => {
   }
 });
 
-/* ---------------------------------------------------
-   Night Summary
---------------------------------------------------- */
+// Night summary
 app.get("/night-summary", async (req, res) => {
   if (!bot || !SUPPLIER_CHAT_ID) return res.send("BOT DISABLED");
-  const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
-  const paid = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&select=*`, { headers: sbHeaders });
-  let report = `📊 Daily Summary\nPaid Orders: ${paid.data.length}`;
-  await safeSend(SUPPLIER_CHAT_ID, report);
-  res.send("OK");
+  try {
+    const start = DateTime.now().setZone(TIMEZONE).startOf("day").toUTC().toISO();
+    const paid = await axios.get(`${SUPABASE_URL}/rest/v1/orders?status=eq.paid&paid_at=gte.${encodeURIComponent(start)}&select=*`, { headers: sbHeaders });
+    let report = `📊 Daily Summary\nPaid Orders: ${paid.data.length}`;
+    await safeSend(SUPPLIER_CHAT_ID, report);
+    res.send("OK");
+  } catch (e) {
+    console.error("night-summary error:", e?.response?.data || e?.message || e);
+    res.status(500).send("ERR");
+  }
 });
 
 // ---------------- LISTEN ----------------
