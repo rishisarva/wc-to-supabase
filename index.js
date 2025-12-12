@@ -492,35 +492,46 @@ if (bot) {
   });
 }
 
-/* ---------------------------------------------------
-   /today - list today's paid rows from paid_order_items
---------------------------------------------------- */
+/* -------------------------------------------------// /today (simple version: reads ONLY from paid_order_items)
 if (bot) {
   bot.onText(/\/today/i, async (msg) => {
     const chatId = msg.chat.id;
+
     let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
     try {
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,amount,sku,sizes,technique,created_at`, { headers: sbHeaders, timeout: 10000 });
+      todayKey = DateTime.now().setZone(TIMEZONE).toISODate();
+    } catch (_) {
+      todayKey = new Date().toISOString().slice(0, 10);
+    }
+
+    try {
+      const r = await axios.get(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${todayKey}&select=order_id,name,created_at`,
+        { headers: sbHeaders }
+      );
+
       const rows = r.data || [];
-      if (!rows.length) return safeSend(chatId, "📭 No paid orders yet today.");
-      let headerDate;
-      try { headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd"); } catch (_) { headerDate = new Date().toISOString().slice(0,10); }
-      let text = `${headerDate} orders 🌼\n\n`;
-      rows.forEach((o, idx) => {
-        let dateStr = o.created_at || "";
-        try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-        text += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦  # ${dateStr}\n`;
-      });
+      let text = `${todayKey} orders 🌼\n\n`;
+
+      if (!rows.length) {
+        text += "No paid orders for today.";
+      } else {
+        rows.forEach((o, i) => {
+          let d = "";
+          try {
+            d = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy");
+          } catch (_) {}
+          text += `${i + 1}. ${o.name} (${o.order_id}) 📦 # ${d}\n`;
+        });
+      }
+
       await safeSend(chatId, text);
+
     } catch (e) {
-      console.error("/today error:", e?.response?.data || e?.message || e);
-      await safeSend(chatId, "⚠️ Failed to fetch today's paid orders.");
+      await safeSend(chatId, "⚠️ Error loading today's list.");
     }
   });
-}
-
-/* ---------------------------------------------------
+} ---------------------------------------------------
    /delete_today_preview - show paid_order_items rows for today (safe)
 --------------------------------------------------- */
 if (bot) {
