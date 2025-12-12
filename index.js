@@ -575,85 +575,71 @@ if (bot) {
   });
 }
 
-/* ---------------------------------------------------
-   DELETE TODAY commands
-   /delete_today_preview - lists rows that WOULD be deleted
-   /delete_today_confirm - permanently deletes paid_order_items for today
-     and marks related orders as deleted+hidden (backs up previous_* fields)
+/* /* ---------------------------------------------------
+   DELETE TODAY commands (FINAL SIMPLE VERSION)
+   /delete_today_preview  → shows what will be deleted
+   /delete_today_confirm  → permanently deletes only today's paid_order_items
 --------------------------------------------------- */
+
 if (bot) {
+
+  // Preview rows for today
   bot.onText(/\/delete_today_preview/i, async (msg) => {
     const chatId = msg.chat.id;
+
     let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); }
+    catch (_) { todayKey = new Date().toISOString().slice(0, 10); }
+
     try {
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=id,order_id,name,created_at`, { headers: sbHeaders });
+      const r = await axios.get(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${todayKey}&select=id,order_id,name,created_at`,
+        { headers: sbHeaders }
+      );
+
       const rows = r.data || [];
-      if (!rows.length) return safeSend(chatId, `Preview: No paid_order_items found for ${todayKey}.`);
-      let text = `Preview: ${rows.length} paid_order_items for ${todayKey}:\n\n`;
-      rows.forEach((r2, idx) => {
-        let dateStr = r2.created_at || "";
-        try { dateStr = DateTime.fromISO(r2.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-        text += `${idx+1}. id:${r2.id} | ${r2.name || "-"} | order:${r2.order_id} | ${dateStr}\n`;
+      if (!rows.length)
+        return safeSend(chatId, `📭 No paid orders for ${todayKey}.`);
+
+      let text = `Preview delete for ${todayKey}:\n\n`;
+      rows.forEach((x, i) => {
+        text += `${i + 1}. ID:${x.id} | ${x.name} | Order:${x.order_id}\n`;
       });
-      text += `\nRun /delete_today_confirm to permanently delete these paid_order_items and mark related orders deleted.`;
+
+      text += `\nRun /delete_today_confirm to permanently delete today's list.`;
+
       await safeSend(chatId, text);
-    } catch (e) {
-      console.error("/delete_today_preview error:", e?.response?.data || e?.message || e);
-      await safeSend(chatId, "⚠️ Failed to preview deletions.");
+    } catch (err) {
+      console.error(err);
+      await safeSend(chatId, "⚠️ Could not load preview.");
     }
   });
 
+  // Delete today's list permanently
   bot.onText(/\/delete_today_confirm/i, async (msg) => {
     const chatId = msg.chat.id;
+
     let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); }
+    catch (_) { todayKey = new Date().toISOString().slice(0, 10); }
+
     try {
-      // get paid rows
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=id,order_id`, { headers: sbHeaders });
-      const rows = r.data || [];
-      if (!rows.length) return safeSend(chatId, `Nothing to delete for ${todayKey}.`);
-      const orderIds = rows.map(x => x.order_id).filter(Boolean);
+      // DELETE all rows for today
+      await axios.delete(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${todayKey}`,
+        { headers: sbHeaders }
+      );
 
-      // Delete paid_order_items rows (permanent)
-      // Note: Supabase REST DELETE requires primary key; we'll delete by day - Supabase allows filter
-      await axios.delete(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}`, { headers: sbHeaders });
+      await safeSend(chatId,
+        `🗑️ Today's paid list (${todayKey}) has been cleared permanently.\nRun /today to verify.`
+      );
 
-      // For safety: backup and mark orders as deleted+hidden (so you can restore via previous_* if needed)
-      for (const oid of orderIds) {
-        try {
-          // fetch order to populate backup
-          const fr = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(oid)}&select=*`, { headers: sbHeaders });
-          const [ord] = fr.data || [];
-          if (!ord) continue;
-          const backup = {
-            previous_status: ord.status || null,
-            previous_paid_at: ord.paid_at || null,
-            previous_amount: ord.amount || null,
-            previous_next_message: ord.next_message || null,
-            previous_reminder_24_sent: ord.reminder_24_sent || false,
-            previous_reminder_48_sent: ord.reminder_48_sent || false,
-            previous_reminder_72_sent: ord.reminder_72_sent || false
-          };
-          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(oid)}`, Object.assign({
-            status: "deleted",
-            hidden_from_today: true,
-            next_message: null,
-            reminder_24_sent: true,
-            reminder_48_sent: true,
-            reminder_72_sent: true
-          }, backup), { headers: sbHeaders });
-        } catch (e2) {
-          console.error("Error marking order deleted for", oid, e2?.response?.data || e2?.message || e2);
-        }
-      }
-
-      await safeSend(chatId, `✅ Deleted ${rows.length} paid_order_items for ${todayKey} and marked ${orderIds.length} orders deleted/hidden.`);
-    } catch (e) {
-      console.error("/delete_today_confirm error:", e?.response?.data || e?.message || e);
-      await safeSend(chatId, "⚠️ Failed to delete today's paid_order_items.");
+    } catch (err) {
+      console.error(err?.response?.data || err);
+      await safeSend(chatId, "⚠️ Delete failed.");
     }
   });
+
 }
 
 // ---------------- LISTEN ----------------
