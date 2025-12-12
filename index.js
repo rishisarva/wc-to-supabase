@@ -235,40 +235,70 @@ if (bot) {
     safeSend(chatId, out);
   });
 }
-
-/* ---------------- DELETE TODAY ---------------- */
+/* ---------------- DELETE TODAY (FINAL WORKING VERSION) ---------------- */
 if (bot) {
+
+  // Preview today's rows based on created_at timestamp
   bot.onText(/\/delete_today_preview/, async (msg) => {
     const chatId = msg.chat.id;
 
-    const today = DateTime.now().setZone(TIMEZONE).toISODate();
+    let today;
+    try { today = DateTime.now().setZone(TIMEZONE).toISODate(); }
+    catch (_) { today = new Date().toISOString().slice(0, 10); }
 
-    const r = await axios.get(
-      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${today}&select=id,order_id,name`,
-      { headers: sbHeaders }
-    );
+    const start = `${today}T00:00:00Z`;
+    const end   = `${today}T23:59:59Z`;
 
-    const rows = r.data || [];
-    if (!rows.length) return safeSend(chatId, `📭 No paid orders for ${today}`);
+    try {
+      const r = await axios.get(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?created_at=gte.${start}&created_at=lt.${end}&select=id,order_id,name,created_at`,
+        { headers: sbHeaders }
+      );
 
-    let out = `Preview delete for ${today}:\n\n`;
-    rows.forEach((x, i) => out += `${i + 1}. ${x.name} | order:${x.order_id}\n`);
-    out += `\nRun /delete_today_confirm to delete.`;
+      const rows = r.data || [];
+      if (!rows.length)
+        return safeSend(chatId, `📭 No paid orders for ${today}.`);
 
-    safeSend(chatId, out);
+      let out = `Preview delete for ${today}:\n\n`;
+      rows.forEach((x, i) => {
+        out += `${i + 1}. ${x.name} | Order:${x.order_id}\n`;
+      });
+
+      out += `\nRun /delete_today_confirm to delete permanently.`;
+
+      await safeSend(chatId, out);
+
+    } catch (e) {
+      console.error("delete_preview error", e?.response?.data || e);
+      await safeSend(chatId, "⚠️ Could not load preview.");
+    }
   });
 
+  // Permanently delete today's rows
   bot.onText(/\/delete_today_confirm/, async (msg) => {
     const chatId = msg.chat.id;
-    const today = DateTime.now().setZone(TIMEZONE).toISODate();
 
-    await axios.delete(
-      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${today}`,
-      { headers: sbHeaders }
-    );
+    let today;
+    try { today = DateTime.now().setZone(TIMEZONE).toISODate(); }
+    catch (_) { today = new Date().toISOString().slice(0, 10); }
 
-    safeSend(chatId, `🗑️ Cleared today's paid list (${today}). Run /today to verify.`);
+    const start = `${today}T00:00:00Z`;
+    const end   = `${today}T23:59:59Z`;
+
+    try {
+      await axios.delete(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?created_at=gte.${start}&created_at=lt.${end}`,
+        { headers: sbHeaders }
+      );
+
+      await safeSend(chatId, `🗑️ Cleared ALL paid orders for ${today}.\nRun /today to verify.`);
+
+    } catch (e) {
+      console.error("delete_confirm error", e?.response?.data || e);
+      await safeSend(chatId, "⚠️ Delete failed.");
+    }
   });
+
 }
 
 const PORT = process.env.PORT || 10000;
