@@ -1,8 +1,6 @@
 // index.js — VisionsJersey automation (Final: robust multi-item, webhook/polling safe)
 // 2025-12 - Finalized: handles multi-item orders, sizes & technique extraction,
-// inserts into paid_order_items, robust fallbacks when columns differ,
-// supplier format requested layout, today's list (short), and delete-today commands.
-
+// inserts into paid_order_items, robust fallbacks when columns differ.
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -83,11 +81,15 @@ async function safeSend(chatId, text) {
     } catch (_) {}
   }
 }
+function capitalizeWords(s) {
+  if (!s) return s;
+  return s.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
 
 // ---------------- HEALTH ----------------
 app.get("/", (req, res) => res.send("🔥 WC → Supabase Automation Live (final)"));
 
-// ---------------- TELEGRAM WEBHOOK RECEIVER (if webhook mode) ----------------
+// TELEGRAM webhook receiver (if using webhook mode)
 app.post("/telegram-webhook", (req, res) => {
   if (!bot) return res.sendStatus(501);
   try {
@@ -104,14 +106,14 @@ app.post("/telegram-webhook", (req, res) => {
    Returns array of items: { sku, name, quantity, size, technique }
 ---------------------*/
 function extractItemsFromIncoming(order) {
+  // Try multiple shapes: order.items (JSON string), order.line_items array, or nested structures.
   let rawItems = [];
+
   try {
     if (order.items) {
       if (typeof order.items === "string") {
         try { rawItems = JSON.parse(order.items) || []; } catch (_) { rawItems = []; }
-      } else if (Array.isArray(order.items)) {
-        rawItems = order.items;
-      }
+      } else if (Array.isArray(order.items)) rawItems = order.items;
     }
   } catch (_) { rawItems = []; }
 
@@ -177,7 +179,7 @@ function extractItemsFromIncoming(order) {
 ---------------------------------*/
 app.post("/woocommerce-webhook", async (req, res) => {
   try {
-    const order = req.body.order || req.body || {};
+    const order = req.body.order || req.body || {}; // support both shapes
     if (!order) return res.status(200).send("NO ORDER");
 
     const items = extractItemsFromIncoming(order) || [];
@@ -229,6 +231,7 @@ app.post("/woocommerce-webhook", async (req, res) => {
       previous_reminder_48_sent: null,
       previous_reminder_72_sent: null,
 
+      // Save raw items for auditing (string)
       items: JSON.stringify(items)
     };
 
@@ -236,6 +239,7 @@ app.post("/woocommerce-webhook", async (req, res) => {
       await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
     } catch (insertErr) {
       console.error("Supabase insert (orders) error:", insertErr?.response?.data || insertErr?.message || insertErr);
+      // still ACK Woo
     }
 
     return res.status(200).send("OK");
@@ -263,9 +267,8 @@ if (bot) {
 /clear_today - hide today's paid view (local only)
 /paidorders - choose date (D-3..D+3)
 
-DELETE (use preview first):
 /delete_today_preview - preview which paid_order_items will be deleted (safe)
-/delete_today_confirm - permanently delete today's paid_order_items and mark orders deleted
+/delete_today_confirm - permanently delete today's paid_order_items (only paid_order_items)
 `;
     await safeSend(chatId, text);
   });
@@ -276,7 +279,7 @@ DELETE (use preview first):
 --------------------------------------------------- */
 async function handleMarkPaid(chatId, orderId) {
   console.log("handleMarkPaid:", orderId);
-  // 1) Fetch order
+  // 1) Fetch order (robust)
   let fetchRes;
   try {
     fetchRes = await axios.get(
@@ -331,7 +334,7 @@ async function handleMarkPaid(chatId, orderId) {
     console.error("Supabase patch (paid) failed:", e?.response?.data || e?.message || e);
   }
 
-  // Normalize items
+  // Normalize items either from order fields or parse saved items JSON
   let items = [];
   try {
     if (order.items) {
@@ -380,30 +383,34 @@ async function handleMarkPaid(chatId, orderId) {
     console.error("Insert paid_order_items failed:", e?.response?.data || e?.message || e);
   }
 
-  // 5) Build supplier format EXACT requested layout (forced size+technique)
-try {
-  const skuLines = [];
-  const productLines = [];
+  // 5) Build supplier format EXACT requested layout
+  try {
+    const skuLines = [];
+    const productLines = [];
 
-  // Prepare forced sizes/techniques arrays
-  const sizeArr = (order.sizes || "").split(",").map(s => s.trim());
-  const techArr = (order.technique || "").split(",").map(s => s.trim());
+    if (!items.length && order.product) {
+      const prods = (order.product + "").split("|").map(s => s.trim()).filter(Boolean);
+      const sks = (order.sku + "").split("|").map(s => s.trim()).filter(Boolean);
+      const sizesArr = (order.sizes || "").split(",").map(s => s.trim()).filter(Boolean);
+      const techArr = (order.technique || "").split(",").map(s => s.trim()).filter(Boolean);
 
-  items.forEach((it, idx) => {
-    const sku = it.sku || "-";
-    const name = it.name || "-";
+      for (let i = 0; i < Math.max(prods.length, sks.length); i++) {
+        skuLines.push(`${i + 1}.${(sks[i] || "-")}`); // "1.VJ90"
+        const sizeTxt = (sizesArr[i] || sizesArr[0] || "").toUpperCase();
+        const techTxt = capitalizeWords((techArr[i] || "").replace(/-/g, " "));
+        productLines.push(`${i + 1}. ${prods[i] || "-"}${sizeTxt ? ` • size: ${sizeTxt}` : ""}${techTxt ? ` • Technique: ${techTxt}` : ""}`);
+      }
+    } else {
+      items.forEach((it, idx) => {
+        skuLines.push(`${idx + 1}.${(it.sku || "-")}`); // "1.VJ90"
+        const sizeFmt = (it.size || "").toString() ? ` • size: ${String(it.size).toUpperCase()}` : "";
+        const techFmt = (it.technique || "").toString() ? ` • Technique: ${capitalizeWords(it.technique.replace(/-/g, " "))}` : "";
+        productLines.push(`${idx + 1}. ${it.name || "-"}${sizeFmt}${techFmt}`);
+      });
+    }
 
-    const forcedSize = (sizeArr[idx] || sizeArr[0] || "").toUpperCase();
-    const forcedTech = (techArr[idx] || techArr[0] || "").replace(/-/g, " ");
-
-    skuLines.push(`${idx + 1}.${sku}`);
-
-    productLines.push(
-      `${idx + 1}. ${name} • size: ${forcedSize} • Technique: ${forcedTech}`
-    );
-  });
-
-  const supplierText =
+    // Join product lines with a blank line between items
+    const supplierText =
 `📦 NEW PAID ORDER
 
 From:
@@ -418,29 +425,29 @@ Pincode: ${order.pincode || ""}
 Phone: ${order.phone || ""}
 
 SKU ID:
-${skuLines.join("\n")}
+${skuLines.length ? skuLines.join("\n") : (order.sku || "-")}
 
 Product:
-${productLines.join("\n\n")}
+${productLines.length ? productLines.join("\n\n") : (order.product || "-")}
 
-Quantity: ${order.quantity || items.reduce((s, it) => s + (it.quantity || 1), 0)}
+Quantity: ${order.quantity || items.reduce((s, it) => s + (it.quantity || 1), 0) || 1}
 
 Shipment Mode: Normal
 `;
 
-  if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
-  await safeSend(chatId, supplierText);
+    if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
+    await safeSend(chatId, supplierText);
+  } catch (e) {
+    console.error("Failed to build/send supplier text:", e?.message || e);
+  }
 
-} catch (e) {
-  console.error("Failed to build/send supplier text:", e?.message || e);
-}
-  // 6) Build today's paid list (short format A)
+  // 6) Build today's paid list (source: paid_order_items table)
   try {
     let dayKey;
     try { dayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { dayKey = new Date().toISOString().slice(0, 10); }
 
     const paidItemsRes = await axios.get(
-      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=order_id,name,created_at`,
+      `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dayKey)}&select=order_id,name,amount,created_at,sku,sizes,technique`,
       { headers: sbHeaders, timeout: 10000 }
     );
     const saved = paidItemsRes.data || [];
@@ -455,7 +462,7 @@ Shipment Mode: Normal
       saved.forEach((r, idx) => {
         let dateStr = r.created_at || "";
         try { dateStr = DateTime.fromISO(r.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-        listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) 📦  # ${dateStr}\n`;
+        listText += `${idx + 1}. ${r.name || "-"} (${r.order_id}) ₹${r.amount || 0} | SKU: ${r.sku || "-"} | Size: ${r.sizes || "-"} | Tech: ${r.technique || "-"} — ${dateStr}\n`;
       });
     }
     await safeSend(chatId, listText);
@@ -486,7 +493,95 @@ if (bot) {
 }
 
 /* ---------------------------------------------------
-   Other helper commands (order panel, resend_qr, track, today, paidorders)
+   /today - list today's paid rows from paid_order_items
+--------------------------------------------------- */
+if (bot) {
+  bot.onText(/\/today/i, async (msg) => {
+    const chatId = msg.chat.id;
+    let todayKey;
+    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+    try {
+      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,amount,sku,sizes,technique,created_at`, { headers: sbHeaders, timeout: 10000 });
+      const rows = r.data || [];
+      if (!rows.length) return safeSend(chatId, "📭 No paid orders yet today.");
+      let headerDate;
+      try { headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd"); } catch (_) { headerDate = new Date().toISOString().slice(0,10); }
+      let text = `${headerDate} orders 🌼\n\n`;
+      rows.forEach((o, idx) => {
+        let dateStr = o.created_at || "";
+        try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
+        text += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦  # ${dateStr}\n`;
+      });
+      await safeSend(chatId, text);
+    } catch (e) {
+      console.error("/today error:", e?.response?.data || e?.message || e);
+      await safeSend(chatId, "⚠️ Failed to fetch today's paid orders.");
+    }
+  });
+}
+
+/* ---------------------------------------------------
+   /delete_today_preview - show paid_order_items rows for today (safe)
+--------------------------------------------------- */
+if (bot) {
+  bot.onText(/\/delete_today_preview/i, async (msg) => {
+    const chatId = msg.chat.id;
+    let todayKey;
+    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+    try {
+      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=id,order_id,name,amount,sku,sizes,technique,created_at`, { headers: sbHeaders });
+      const rows = r.data || [];
+      if (!rows.length) return safeSend(chatId, `No paid_order_items found for ${todayKey}.`);
+      let txt = `Will delete ${rows.length} rows for ${todayKey}:\n\n`;
+      rows.forEach((row, i) => {
+        let dateStr = row.created_at || "";
+        try { dateStr = DateTime.fromISO(row.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
+        txt += `${i+1}. id:${row.id} | ${row.name || "-"} | ${row.order_id} | ₹${row.amount || 0} | SKU:${row.sku || "-"} | Size:${row.sizes || "-"} | Tech:${row.technique || "-"} — ${dateStr}\n`;
+      });
+      txt += `\nRun /delete_today_confirm to permanently delete these rows (only paid_order_items).`;
+      await safeSend(chatId, txt);
+    } catch (e) {
+      console.error("/delete_today_preview error:", e?.response?.data || e?.message || e);
+      await safeSend(chatId, "⚠️ Failed to preview deletions.");
+    }
+  });
+}
+
+/* ---------------------------------------------------
+   /delete_today_confirm - permanently delete today's paid_order_items (ONLY paid_order_items)
+--------------------------------------------------- */
+if (bot) {
+  bot.onText(/\/delete_today_confirm/i, async (msg) => {
+    const chatId = msg.chat.id;
+    let todayKey;
+    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+
+    try {
+      // fetch rows first to report count and IDs
+      const fetch = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=id,order_id`, { headers: sbHeaders, timeout: 10000 });
+      const rows = fetch.data || [];
+      if (!rows.length) {
+        return safeSend(chatId, `Nothing to delete for ${todayKey}.`);
+      }
+
+      // collect IDs for reporting
+      const ids = rows.map(r => r.id);
+
+      // perform delete
+      // Use DELETE on the endpoint with day filter
+      await axios.delete(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}`, { headers: sbHeaders, timeout: 10000 });
+
+      await safeSend(chatId, `✅ Deleted ${rows.length} paid_order_items for ${todayKey}. (IDs: ${ids.join(", ")})\nNote: only paid_order_items rows were removed.`);
+    } catch (e) {
+      console.error("/delete_today_confirm error:", e?.response?.data || e?.message || e);
+      await safeSend(chatId, "⚠️ Failed to delete today's paid_order_items.");
+    }
+  });
+}
+
+/* ---------------------------------------------------
+   Other helper commands (order panel, resend_qr, track, paidorders, export_today)
+   Keep behaviors consistent with paid_order_items as source where appropriate.
 --------------------------------------------------- */
 
 // /order (panel)
@@ -548,110 +643,163 @@ if (bot) {
   });
 }
 
-// /today - short list (same format A)
+// /paidorders (date buttons)
 if (bot) {
-  bot.onText(/\/today/i, async (msg) => {
+  bot.onText(/\/paidorders/i, async (msg) => {
     const chatId = msg.chat.id;
-    let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
-    if (!bot) return;
-    try {
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,created_at`, { headers: sbHeaders });
-      const rows = r.data || [];
-      let headerDate;
-      try { headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd"); } catch (_) { headerDate = new Date().toISOString().slice(0,10); }
-      if (!rows.length) return safeSend(chatId, `${headerDate} orders 🌼\n\nNo paid orders for today yet.`);
-      let text = `${headerDate} orders 🌼\n\n`;
-      rows.forEach((o, idx) => {
-        let dateStr = o.created_at || "";
-        try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-        text += `${idx + 1}. ${o.name || "-"} (${o.order_id}) 📦  # ${dateStr}\n`;
-      });
-      await safeSend(chatId, text);
-    } catch (e) {
-      console.error("/today error:", e?.response?.data || e?.message || e);
-      await safeSend(chatId, "⚠️ Failed to fetch today's paid orders.");
+    let base;
+    try { base = DateTime.now().setZone(TIMEZONE).startOf("day"); } catch (_) { base = DateTime.now(); }
+    const buttons = [];
+    const row1 = [];
+    for (let i = -3; i <= -1; i++) {
+      const d = base.plus({ days: i });
+      row1.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
     }
+    buttons.push(row1);
+    buttons.push([{ text: "Today", callback_data: `paidorders:${base.toISODate()}` }]);
+    const row3 = [];
+    for (let i = 1; i <= 3; i++) {
+      const d = base.plus({ days: i });
+      row3.push({ text: d.toFormat("dd/MM"), callback_data: `paidorders:${d.toISODate()}` });
+    }
+    buttons.push(row3);
+    await bot.sendMessage(chatId, "📅 Choose a date to view paid orders:", { reply_markup: { inline_keyboard: buttons } });
   });
 }
 
-/* ---------------------------------------------------
-   DELETE TODAY commands
-   /delete_today_preview - lists rows that WOULD be deleted
-   /delete_today_confirm - permanently deletes paid_order_items for today
-     and marks related orders as deleted+hidden (backs up previous_* fields)
---------------------------------------------------- */
+// callback handler for inline keyboard actions (paid, resend, cancel, paidorders date)
 if (bot) {
-  bot.onText(/\/delete_today_preview/i, async (msg) => {
-    const chatId = msg.chat.id;
-    let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+  bot.on("callback_query", async (query) => {
+    const data = query.data || "";
+    const chatId = query.message.chat.id;
     try {
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=id,order_id,name,created_at`, { headers: sbHeaders });
-      const rows = r.data || [];
-      if (!rows.length) return safeSend(chatId, `Preview: No paid_order_items found for ${todayKey}.`);
-      let text = `Preview: ${rows.length} paid_order_items for ${todayKey}:\n\n`;
-      rows.forEach((r2, idx) => {
-        let dateStr = r2.created_at || "";
-        try { dateStr = DateTime.fromISO(r2.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-        text += `${idx+1}. id:${r2.id} | ${r2.name || "-"} | order:${r2.order_id} | ${dateStr}\n`;
-      });
-      text += `\nRun /delete_today_confirm to permanently delete these paid_order_items and mark related orders deleted.`;
-      await safeSend(chatId, text);
-    } catch (e) {
-      console.error("/delete_today_preview error:", e?.response?.data || e?.message || e);
-      await safeSend(chatId, "⚠️ Failed to preview deletions.");
-    }
-  });
-
-  bot.onText(/\/delete_today_confirm/i, async (msg) => {
-    const chatId = msg.chat.id;
-    let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
-    try {
-      // get paid rows
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=id,order_id`, { headers: sbHeaders });
-      const rows = r.data || [];
-      if (!rows.length) return safeSend(chatId, `Nothing to delete for ${todayKey}.`);
-      const orderIds = rows.map(x => x.order_id).filter(Boolean);
-
-      // Delete paid_order_items rows (permanent)
-      // Note: Supabase REST DELETE requires primary key; we'll delete by day - Supabase allows filter
-      await axios.delete(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}`, { headers: sbHeaders });
-
-      // For safety: backup and mark orders as deleted+hidden (so you can restore via previous_* if needed)
-      for (const oid of orderIds) {
-        try {
-          // fetch order to populate backup
-          const fr = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(oid)}&select=*`, { headers: sbHeaders });
-          const [ord] = fr.data || [];
-          if (!ord) continue;
+      if (data.startsWith("order_paid:")) {
+        const orderId = data.split(":")[1]; await handleMarkPaid(chatId, orderId);
+      } else if (data.startsWith("order_resend:")) {
+        const orderId = data.split(":")[1];
+        await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, { resend_qr_pending: true }, { headers: sbHeaders });
+        await safeSend(chatId, `🔁 QR resend triggered for order ${orderId}.`);
+      } else if (data.startsWith("order_track:")) {
+        const orderId = data.split(":")[1];
+        await safeSend(chatId, `To set tracking, use:\n/track ${orderId} <phone> <tracking_id>`);
+      } else if (data.startsWith("order_cancel:")) {
+        const orderId = data.split(":")[1];
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "🗂 Cancel only in today list", callback_data: `order_cancel_action:${orderId}:only_list` },
+              { text: "❌ Cancel in Woo+Supabase", callback_data: `order_cancel_action:${orderId}:full` }
+            ],
+            [
+              { text: "♻️ Restore (if cancelled)", callback_data: `order_cancel_action:${orderId}:restore` }
+            ]
+          ]
+        };
+        await bot.sendMessage(chatId, `Choose cancel action for order ${orderId}:`, { reply_markup: keyboard });
+      } else if (data.startsWith("order_cancel_action:")) {
+        const parts = data.split(":");
+        const orderId = parts[1];
+        const action = parts[2];
+        if (action === "only_list") {
+          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, { hidden_from_today: true }, { headers: sbHeaders });
+          await safeSend(chatId, `✅ Order ${orderId} hidden from today's list.`);
+        } else if (action === "full") {
+          const fetchRes = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`, { headers: sbHeaders });
+          const rows = fetchRes.data || [];
+          if (!rows.length) return safeSend(chatId, `Order ${orderId} not found.`);
+          const o = rows[0];
           const backup = {
-            previous_status: ord.status || null,
-            previous_paid_at: ord.paid_at || null,
-            previous_amount: ord.amount || null,
-            previous_next_message: ord.next_message || null,
-            previous_reminder_24_sent: ord.reminder_24_sent || false,
-            previous_reminder_48_sent: ord.reminder_48_sent || false,
-            previous_reminder_72_sent: ord.reminder_72_sent || false
+            previous_status: o.status || null,
+            previous_paid_at: o.paid_at || null,
+            previous_amount: o.amount || null,
+            previous_next_message: o.next_message || null,
+            previous_reminder_24_sent: o.reminder_24_sent || false,
+            previous_reminder_48_sent: o.reminder_48_sent || false,
+            previous_reminder_72_sent: o.reminder_72_sent || false
           };
-          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(oid)}`, Object.assign({
-            status: "deleted",
-            hidden_from_today: true,
+          if (WC_USER && WC_PASS) {
+            try {
+              await axios.put(`https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`, { status: "cancelled" }, { auth: { username: WC_USER, password: WC_PASS } });
+            } catch (e) { console.error("Woo cancel failed:", e?.response?.data || e?.message || e); }
+          }
+          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, Object.assign({
+            status: "cancelled",
             next_message: null,
             reminder_24_sent: true,
             reminder_48_sent: true,
-            reminder_72_sent: true
+            reminder_72_sent: true,
+            hidden_from_today: true
           }, backup), { headers: sbHeaders });
-        } catch (e2) {
-          console.error("Error marking order deleted for", oid, e2?.response?.data || e2?.message || e2);
+          await safeSend(chatId, `❌ Order ${orderId} cancelled in WooCommerce (attempted) and Supabase. Restore is available.`);
+        } else if (action === "restore") {
+          const fetchRes = await axios.get(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}&select=*`, { headers: sbHeaders });
+          const rows = fetchRes.data || [];
+          if (!rows.length) return safeSend(chatId, `Order ${orderId} not found.`);
+          const o = rows[0];
+          if (!o.previous_status) return safeSend(chatId, `No previous state found for order ${orderId}. Cannot restore.`);
+          if (WC_USER && WC_PASS) {
+            try {
+              await axios.put(`https://visionsjersey.com/wp-json/wc/v3/orders/${orderId}`, { status: o.previous_status }, { auth: { username: WC_USER, password: WC_PASS } });
+            } catch (e) { console.error("Woo restore failed:", e?.response?.data || e?.message || e); }
+          }
+          await axios.patch(`${SUPABASE_URL}/rest/v1/orders?order_id=eq.${encodeURIComponent(orderId)}`, {
+            status: o.previous_status,
+            paid_at: o.previous_paid_at,
+            amount: o.previous_amount,
+            next_message: o.previous_next_message,
+            reminder_24_sent: o.previous_reminder_24_sent,
+            reminder_48_sent: o.previous_reminder_48_sent,
+            reminder_72_sent: o.previous_reminder_72_sent,
+            hidden_from_today: false,
+            previous_status: null,
+            previous_paid_at: null,
+            previous_amount: null,
+            previous_next_message: null,
+            previous_reminder_24_sent: null,
+            previous_reminder_48_sent: null,
+            previous_reminder_72_sent: null
+          }, { headers: sbHeaders });
+          await safeSend(chatId, `♻️ Order ${orderId} restored to previous status.`);
+        } else {
+          await safeSend(chatId, "Unknown cancel action.");
         }
+      } else if (data.startsWith("paidorders:")) {
+        const dateKey = data.split(":")[1]; // YYYY-MM-DD
+        let start, end;
+        try {
+          const d = DateTime.fromISO(dateKey, { zone: TIMEZONE });
+          start = d.startOf("day").toUTC().toISO();
+          end = d.plus({ days: 1 }).startOf("day").toUTC().toISO();
+        } catch (_) {
+          const d = DateTime.now();
+          start = d.toISOString();
+          end = new Date(d.getTime() + 24 * 3600000).toISOString();
+        }
+        try {
+          const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(dateKey)}&select=order_id,name,amount,created_at,sku,sizes,technique`, { headers: sbHeaders });
+          const rows = r.data || [];
+          let header = `${dateKey} paid orders 🌼\n\n`;
+          if (!rows.length) header += "No paid orders on this date.";
+          else {
+            rows.forEach((o, idx) => {
+              let dateStr = o.created_at;
+              try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
+              header += `${idx + 1}. ${o.name || ""} (${o.order_id}) 📦 # ${dateStr}\n`;
+            });
+          }
+          await safeSend(chatId, header);
+        } catch (e) {
+          console.error("paidorders fetch error (paid_order_items):", e?.response?.data || e?.message || e);
+          await safeSend(chatId, "⚠️ Failed to fetch paid orders for that date.");
+        }
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: "Action received" });
       }
-
-      await safeSend(chatId, `✅ Deleted ${rows.length} paid_order_items for ${todayKey} and marked ${orderIds.length} orders deleted/hidden.`);
     } catch (e) {
-      console.error("/delete_today_confirm error:", e?.response?.data || e?.message || e);
-      await safeSend(chatId, "⚠️ Failed to delete today's paid_order_items.");
+      console.error("callback_query error:", e?.response?.data || e?.message || e);
+      try { await safeSend(chatId, "⚠️ Error handling button action."); } catch (_) {}
+    } finally {
+      try { await bot.answerCallbackQuery(query.id); } catch (_) {}
     }
   });
 }
