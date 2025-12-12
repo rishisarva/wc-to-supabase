@@ -548,26 +548,40 @@ if (bot) {
   });
 }
 
-// /today - short list (same format A)
+// /today - ALWAYS read from paid_order_items only
 if (bot) {
   bot.onText(/\/today/i, async (msg) => {
     const chatId = msg.chat.id;
+
     let todayKey;
-    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); } catch (_) { todayKey = new Date().toISOString().slice(0,10); }
-    if (!bot) return;
+    try { todayKey = DateTime.now().setZone(TIMEZONE).toISODate(); }
+    catch (_) { todayKey = new Date().toISOString().slice(0,10); }
+
     try {
-      const r = await axios.get(`${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${encodeURIComponent(todayKey)}&select=order_id,name,created_at`, { headers: sbHeaders });
-      const rows = r.data || [];
+      const res = await axios.get(
+        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${todayKey}&select=order_id,name,created_at`,
+        { headers: sbHeaders }
+      );
+
+      const rows = res.data || [];
+
       let headerDate;
-      try { headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd"); } catch (_) { headerDate = new Date().toISOString().slice(0,10); }
-      if (!rows.length) return safeSend(chatId, `${headerDate} orders 🌼\n\nNo paid orders for today yet.`);
+      try { headerDate = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd"); }
+      catch (_) { headerDate = new Date().toISOString().slice(0,10); }
+
+      if (!rows.length) {
+        return safeSend(chatId, `${headerDate} orders 🌼\n\nNo paid orders for today yet.`);
+      }
+
       let text = `${headerDate} orders 🌼\n\n`;
-      rows.forEach((o, idx) => {
-        let dateStr = o.created_at || "";
-        try { dateStr = DateTime.fromISO(o.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
-        text += `${idx + 1}. ${o.name || "-"} (${o.order_id}) 📦  # ${dateStr}\n`;
+      rows.forEach((r, idx) => {
+        let dateStr = r.created_at || "";
+        try { dateStr = DateTime.fromISO(r.created_at).setZone(TIMEZONE).toFormat("dd/LL/yyyy"); } catch (_) {}
+        text += `${idx + 1}. ${r.name || "-"} (${r.order_id}) 📦  # ${dateStr}\n`;
       });
+
       await safeSend(chatId, text);
+
     } catch (e) {
       console.error("/today error:", e?.response?.data || e?.message || e);
       await safeSend(chatId, "⚠️ Failed to fetch today's paid orders.");
