@@ -640,9 +640,14 @@ if (bot) {
     try {
       // DELETE all rows for today
       await axios.delete(
-        `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${todayKey}`,
-        { headers: sbHeaders }
-      );
+  `${SUPABASE_URL}/rest/v1/paid_order_items?day=eq.${todayKey}`,
+  { 
+    headers: { 
+      ...sbHeaders,
+      Prefer: "return=minimal"
+    }
+  }
+);
 
       await safeSend(chatId,
         `🗑️ Today's paid list (${todayKey}) has been cleared permanently.\nRun /today to verify.`
