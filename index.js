@@ -380,31 +380,30 @@ async function handleMarkPaid(chatId, orderId) {
     console.error("Insert paid_order_items failed:", e?.response?.data || e?.message || e);
   }
 
-  // 5) Build supplier format EXACT requested layout (SKU lines "1.VJ90" and product lines)
-  try {
-    const skuLines = [];
-    const productLines = [];
-    if (!items.length && order.product) {
-      const prods = (order.product + "").split("|").map(s => s.trim()).filter(Boolean);
-      const sks = (order.sku + "").split("|").map(s => s.trim()).filter(Boolean);
-      const sizesArr = (order.sizes || "").split(",").map(s => s.trim()).filter(Boolean);
-      const techArr = (order.technique || "").split(",").map(s => s.trim()).filter(Boolean);
-      for (let i = 0; i < Math.max(prods.length, sks.length); i++) {
-        skuLines.push(`${i + 1}.${(sks[i] || "-")}`); // "1.VJ90"
-        const sizeTxt = (sizesArr[i] || sizesArr[0] || "").toUpperCase();
-        const techTxt = (techArr[i] || "").replace(/-/g, " ");
-        productLines.push(`${i + 1}. ${prods[i] || "-"} • size: ${sizeTxt} • Technique: ${techTxt}`);
-      }
-    } else {
-      items.forEach((it, idx) => {
-        skuLines.push(`${idx + 1}.${(it.sku || "-")}`); // "1.VJ90"
-        const sizeFmt = (it.size || "").toString() ? ` • size: ${String(it.size).toUpperCase()}` : "";
-        const techFmt = (it.technique || "").toString() ? ` • Technique: ${it.technique.replace(/-/g, " ")}` : "";
-        productLines.push(`${idx + 1}. ${it.name || "-"}${sizeFmt}${techFmt}`);
-      });
-    }
+  // 5) Build supplier format EXACT requested layout (forced size+technique)
+try {
+  const skuLines = [];
+  const productLines = [];
 
-    const supplierText =
+  // Prepare forced sizes/techniques arrays
+  const sizeArr = (order.sizes || "").split(",").map(s => s.trim());
+  const techArr = (order.technique || "").split(",").map(s => s.trim());
+
+  items.forEach((it, idx) => {
+    const sku = it.sku || "-";
+    const name = it.name || "-";
+
+    const forcedSize = (sizeArr[idx] || sizeArr[0] || "").toUpperCase();
+    const forcedTech = (techArr[idx] || techArr[0] || "").replace(/-/g, " ");
+
+    skuLines.push(`${idx + 1}.${sku}`);
+
+    productLines.push(
+      `${idx + 1}. ${name} • size: ${forcedSize} • Technique: ${forcedTech}`
+    );
+  });
+
+  const supplierText =
 `📦 NEW PAID ORDER
 
 From:
@@ -419,22 +418,22 @@ Pincode: ${order.pincode || ""}
 Phone: ${order.phone || ""}
 
 SKU ID:
-${skuLines.length ? skuLines.join("\n") : (order.sku || "-")}
+${skuLines.join("\n")}
 
 Product:
-${productLines.length ? productLines.join("\n\n") : (order.product || "-")}
+${productLines.join("\n\n")}
 
-Quantity: ${order.quantity || items.reduce((s, it) => s + (it.quantity || 1), 0) || 1}
+Quantity: ${order.quantity || items.reduce((s, it) => s + (it.quantity || 1), 0)}
 
 Shipment Mode: Normal
 `;
 
-    if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
-    await safeSend(chatId, supplierText);
-  } catch (e) {
-    console.error("Failed to build/send supplier text:", e?.message || e);
-  }
+  if (SUPPLIER_CHAT_ID) await safeSend(SUPPLIER_CHAT_ID, supplierText);
+  await safeSend(chatId, supplierText);
 
+} catch (e) {
+  console.error("Failed to build/send supplier text:", e?.message || e);
+}
   // 6) Build today's paid list (short format A)
   try {
     let dayKey;
