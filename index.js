@@ -113,33 +113,59 @@ function extractItemsFromIncoming(order) {
 /* ---------------- Woo Webhook ---------------- */
 app.post("/woocommerce-webhook", async (req, res) => {
   const order = req.body.order || req.body || {};
-  const items = extractItemsFromIncoming(order);
+  if (!order.id) return res.send("NO ORDER ID");
 
-  const billing = order.billing || {};
+  const items = extractItemsFromIncoming(order);
+  const billing = order.billing || order.billing_address || {};
 
   const mapped = {
-    order_id: String(order.id || ""),
-    name: billing.first_name || "",
-    phone: billing.phone || "",
+    order_id: String(order.id),
+    wc_order_id: order.id,
+
+    name:
+      billing.first_name && billing.last_name
+        ? `${billing.first_name} ${billing.last_name}`
+        : billing.first_name || billing.name || "",
+
+    phone: billing.phone || billing.phone_number || "",
     email: billing.email || "",
+
     amount: Number(order.total || 0),
     product: items.map(i => i.name).join(" | "),
     sku: items.map(i => i.sku).join(" | "),
-    sizes: [...new Set(items.map(i => i.size))].join(", "),
-    technique: [...new Set(items.map(i => i.technique))].join(", "),
-    address: billing.address_1 || "",
+    sizes: [...new Set(items.map(i => i.size).filter(Boolean))].join(", "),
+    technique: [...new Set(items.map(i => i.technique).filter(Boolean))].join(", "),
+    quantity: items.reduce((s, i) => s + (i.quantity || 1), 0),
+
+    address: [billing.address_1, billing.address_2, billing.city]
+      .filter(Boolean)
+      .join(", "),
     state: billing.state || "",
-    pincode: billing.postcode || "",
-    quantity: items.reduce((s, i) => s + i.quantity, 0),
+    pincode: billing.postcode || billing.postal_code || "",
+
     status: "pending_payment",
     created_at: nowISO(),
     items: JSON.stringify(items)
   };
 
   try {
-    await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
+    const existing = await axios.get(
+      `${SUPABASE_URL}/rest/v1/orders?order_id=eq.${order.id}&select=order_id`,
+      { headers: sbHeaders }
+    );
+
+    if (existing.data.length) {
+      console.log("ℹ️ Order already exists:", order.id);
+      return res.send("ALREADY EXISTS");
+    }
+
+    await axios.post(
+      `${SUPABASE_URL}/rest/v1/orders`,
+      mapped,
+      { headers: sbHeaders }
+    );
   } catch (e) {
-    console.log("insert error", e.response?.data);
+    console.log("insert error", e.response?.data || e.message);
   }
 
   res.send("OK");
