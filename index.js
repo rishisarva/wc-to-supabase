@@ -178,73 +178,77 @@ function extractItemsFromIncoming(order) {
 app.post("/woocommerce-webhook", async (req, res) => {
   try {
     const order = req.body.order || req.body || {};
-    if (!order) return res.status(200).send("NO ORDER");
+    if (!order?.id) return res.send("NO ORDER");
 
-    const items = extractItemsFromIncoming(order) || [];
+    const items = extractItemsFromIncoming(order);
 
-    const productNames = items.map((it) => it.name).filter(Boolean);
-    const skus = items.map((it) => it.sku).filter(Boolean);
-    const sizesSet = new Set(items.map((it) => it.size).filter(Boolean));
-    const techniqueSet = new Set(items.map((it) => it.technique).filter(Boolean));
-    const totalQty = items.reduce((s, it) => s + (it.quantity || 1), 0);
+    // ✅ SAFE BILLING FALLBACK CHAIN
+    const billing =
+      order.billing ||
+      order.billing_address ||
+      order.shipping ||
+      order.shipping_address ||
+      {};
 
-    const billing = order.billing_address || order.billing || order.billing_address || {};
+    const name =
+      billing.first_name && billing.last_name
+        ? `${billing.first_name} ${billing.last_name}`
+        : billing.first_name ||
+          billing.name ||
+          "";
 
     const mapped = {
-      order_id: String(order.id || order.order_id || order.number || ""),
-      name: (billing.first_name || billing.name || billing.full_name || "") + "",
-      phone: (billing.phone || billing.phone_number || "") + "",
-      email: (billing.email || "") + "",
-      amount: Number(order.total || order.total_amount || order.order_total || 0) || 0,
-      product: productNames.join(" | "),
-      sku: skus.join(" | "),
-      sizes: Array.from(sizesSet).join(", "),
-      technique: Array.from(techniqueSet).join(", "),
-      address: billing.address_1 || billing.address || "",
-      state: billing.state || "",
-      pincode: billing.postcode || billing.postal_code || "",
-      quantity: totalQty,
+      order_id: String(order.id),
+      wc_order_id: order.id,
 
+      // 👤 CUSTOMER (ONLY SET IF EXISTS)
+      name: name || null,
+      phone: billing.phone || billing.phone_number || null,
+      email: billing.email || null,
+
+      // 📦 ORDER
+      amount: Number(order.total || 0),
+      product: items.map(i => i.name).join(" | "),
+      sku: items.map(i => i.sku).join(" | "),
+      sizes: [...new Set(items.map(i => i.size).filter(Boolean))].join(", "),
+      technique: [...new Set(items.map(i => i.technique).filter(Boolean))].join(", "),
+      quantity: items.reduce((s, i) => s + (i.quantity || 1), 0),
+
+      // 📍 ADDRESS
+      address: [
+        billing.address_1,
+        billing.address_2,
+        billing.city
+      ].filter(Boolean).join(", ") || null,
+
+      state: billing.state || null,
+      pincode: billing.postcode || billing.postal_code || null,
+
+      // 🧠 STATUS
       status: "pending_payment",
       created_at: nowISO(),
-
-      message_sent: false,
-      next_message: "reminder_24h",
-      reminder_24_sent: false,
-      reminder_48_sent: false,
-      reminder_72_sent: false,
-      discounted_amount: null,
-      supplier_sent: false,
-      paid_at: null,
-      paid_message_pending: false,
-      resend_qr_pending: false,
-      tracking_sent: false,
-      hidden_from_today: false,
-
-      previous_status: null,
-      previous_paid_at: null,
-      previous_amount: null,
-      previous_next_message: null,
-      previous_reminder_24_sent: null,
-      previous_reminder_48_sent: null,
-      previous_reminder_72_sent: null,
 
       items: JSON.stringify(items)
     };
 
-    try {
-      await axios.post(`${SUPABASE_URL}/rest/v1/orders`, mapped, { headers: sbHeaders });
-    } catch (insertErr) {
-      console.error("Supabase insert (orders) error:", insertErr?.response?.data || insertErr?.message || insertErr);
-    }
+    // ✅ UPSERT (DO NOT OVERWRITE WITH NULLS)
+    await axios.post(
+      `${SUPABASE_URL}/rest/v1/orders?on_conflict=order_id`,
+      mapped,
+      {
+        headers: {
+          ...sbHeaders,
+          Prefer: "resolution=merge-duplicates"
+        }
+      }
+    );
 
-    return res.status(200).send("OK");
-  } catch (err) {
-    console.error("WEBHOOK ERROR:", err?.response?.data || err?.message || err);
-    return res.status(200).send("ERR");
+    res.send("OK");
+  } catch (e) {
+    console.error("WC WEBHOOK ERROR:", e?.response?.data || e);
+    res.send("ERR");
   }
 });
-
 /* ---------------------------------------------------
    /menu  → show commands
 --------------------------------------------------- */
