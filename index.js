@@ -170,6 +170,9 @@ function extractItemsFromIncoming(order) {
 
   return items;
 }
+app.post("/woocommerce-webhook", async (req, res) => {
+  console.log("🔥 WC WEBHOOK RECEIVED");
+  console.log(JSON.stringify(req.body, null, 2));
 
 /* -------------------------------
    /woocommerce-webhook
